@@ -4,7 +4,7 @@ import inspect
 import re
 import gi
 
-import ddcc
+from ddcci import ddcci
 
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk
@@ -33,7 +33,8 @@ class Assistant(Gtk.Assistant):
             tool!
             '''))
         self.append_page(page_allow_scan)
-        self.set_page_complete(page_allow_scan)
+        self.set_page_complete(page_allow_scan, True)
+        self.set_forward_page_func(self.forward)
         '''In the next step every screen will, one by one, change its brightness.
         Select the screen which does so.'''
         '''Continue this assistent on the “blinking” screen.
@@ -51,6 +52,7 @@ class Assistant(Gtk.Assistant):
 
     def forward(self, page_nr):
         if page_nr == 0:
+            print('page is 0')
             monitors = ddcci.Edid.scan()
             self.append_page(Gtk.Label(wrap=True, label=gtext(f'''
                 I found {len(monitors)} monitor(s). If that number is higher
@@ -64,6 +66,7 @@ class Assistant(Gtk.Assistant):
                 ''')))
 
         return page_nr + 1
+
 
 
 
