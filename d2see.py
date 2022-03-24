@@ -51,8 +51,9 @@ class Assistant(Gtk.Assistant):
         Gtk.main_quit()
 
     def forward(self, page_nr):
-        if page_nr == 0:
-            print('page is 0')
+        print(f'forward({page_nr}) called with {self.get_n_pages()} pages.')
+        if page_nr == 0 and not self.get_nth_page(1):
+            print('page 0 is empty')
             monitors = ddcci.Edid.scan()
             self.append_page(Gtk.Label(wrap=True, label=gtext(f'''
                 I found {len(monitors)} monitor(s). If that number is higher
