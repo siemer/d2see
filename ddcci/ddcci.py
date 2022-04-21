@@ -511,5 +511,7 @@ class Monitor(MccsNamed):
 
 
 if __name__ == '__main__':
+  ms = Monitor.scan()
+  TimingTest(ms[0]).test()
   m = Mccs(sys.argv[1])
   print('Brightness', m.read(0x10))
