@@ -7,15 +7,19 @@ import gi
 from ddcci import ddcci
 
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk
+from gi.repository import Gtk, GdkX11
 
 def gtext(text):
     return gtext.single_nl.sub(' ', inspect.cleandoc(text))
 gtext.single_nl = re.compile(r'(?<!\n)\n(?!\n)')
 
+class TestScreen(Gtk.Window):
+    def __init__(self):
+        super().__init__(title='D2see Testscreen')
+
 class Assistant(Gtk.Assistant):
     def __init__(self):
-        super().__init__(title='Deedeecee')
+        super().__init__(title='D2see')
         page_allow_scan = Gtk.Label(wrap=True, label=gtext('''
             This assistent will help you to setup a joint monitor brightness control
             on multi-screen computers with d2see.
@@ -54,9 +58,9 @@ class Assistant(Gtk.Assistant):
         print(f'forward({page_nr}) called with {self.get_n_pages()} pages.')
         if page_nr == 0 and not self.get_nth_page(1):
             print('page 0 is empty')
-            monitors = ddcci.Edid.scan()
+            self.monitors = ddcci.Edid.scan()
             self.append_page(Gtk.Label(wrap=True, label=gtext(f'''
-                I found {len(monitors)} monitor(s). If that number is higher
+                I found {len(self.monitors)} monitor(s). If that number is higher
                 than expected, please tell the author. If it is lower (apart
                 from laptop screens), are you sure that the i2c bus of that
                 monitor is accessible to me?
@@ -65,9 +69,22 @@ class Assistant(Gtk.Assistant):
 
                 For the next steps allow me to go fullscreen on all desktops/workspaces.
                 ''')))
+            self.show_all()
 
         return page_nr + 1
 
+
+class Model(object):
+    def scan(self):
+        self.edids = ddcci.Edid.scan()
+        self.x_display = xd = GdkX11.X11Display.get_default()
+        self.x_monitors = [xd.get_monitor(i) for i in range(xd.get_n_monitors())]
+        # On i3 I can only create a window on each desktop, because the move
+        # operations don't work.
+        # x_window = window.get_window()
+        # x_window.move_to_desktop(int)
+        # x_window.get_desktop()
+        # GdkX11.X11Screen.get_default().get_number_of_desktops()
 
 
 
