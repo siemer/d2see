@@ -28,6 +28,8 @@ import random
 import sys
 import time
 
+import trio
+
 # 1 i2c messages
 # 2 i2c-dev messages
 # 3 ddcci messages
@@ -277,12 +279,12 @@ class Ddcci(I2cDev):
     self.safe_delay = self.waiter.safe_delay
     self.set_delay_permanently = self.waiter.set_delay_permanently
 
-  def write(self, *args):
+  async def write(self, *args):
     ba = bytearray(args)
     ba.insert(0, len(ba) | 0x80)
     ba.insert(0, 0x51)
     ba.append(functools.reduce(operator.xor, ba, 0x6e))
-    self.waiter.wait('w')
+    await self.waiter.wait('w')
     return I2cDev.write(self, ba)
 
   @staticmethod
@@ -295,8 +297,8 @@ class Ddcci(I2cDev):
     if False in checks.values():
       raise IOError(checks)
 
-  def read(self, amount):
-    self.waiter.wait('r')
+  async def read(self, amount):
+    await self.waiter.wait('r')
     b = I2cDev.read(self, amount + 3)
     if not [i for i in b if i]:
       raise CrappyHardwareError()
@@ -330,26 +332,26 @@ class Waiter(object):
     self.delays['rw'] = max(*raw.values())
     print(self.delays)
 
-  def wait(self, which):
+  async def wait(self, which):
     assert which in ('r', 'w')
     succession = self.last_which + which
     wait_time = self.last_when + self.delays[succession] - time.time()
     print(f'{succession}: {wait_time}s')
     if wait_time > 0:
-      time.sleep(wait_time)
+      await trio.sleep(wait_time)
     self.last_when = time.time()
     self.last_which = which
 
 
 class Mccs(Ddcci):
-  def write(self, vcpopcode, value):
-    return Ddcci.write(self, 0x03, vcpopcode, *value.to_bytes(2, 'big'))
+  async def write(self, vcpopcode, value):
+    return await Ddcci.write(self, 0x03, vcpopcode, *value.to_bytes(2, 'big'))
 
-  def read(self, vcpopcode):
+  async def read(self, vcpopcode):
     for i in range(2):
-      Ddcci.write(self, 0x01, vcpopcode)
+      await Ddcci.write(self, 0x01, vcpopcode)
       try:
-        b = Ddcci.read(self, 8)
+        b = await Ddcci.read(self, 8)
       except CrappyHardwareError:
         print('Retrying read() operation.')
         b = bytes(8)
@@ -365,34 +367,107 @@ class Mccs(Ddcci):
       raise IOError(checks)
     return b[3], int.from_bytes(b[4:6], 'big'), int.from_bytes(b[6:8], 'big')
 
-  def flush(self):
-    return Ddcci.write(self, 0x0c)
+  async def flush(self):
+    return await Ddcci.write(self, 0x0c)
 
-  def capabilities(self):
-    Ddcci.write(self, 0xf3, 0, 0)
+  async def capabilities(self):
+    await Ddcci.write(self, 0xf3, 0, 0)
     # ...
 
-  def timing(self):
-    Ddcci.write(self, 0x07)
-    return Ddcci.read(self, 6)
+  async def timing(self):
+    await Ddcci.write(self, 0x07)
+    return await Ddcci.read(self, 6)
 
 class MccsNamed(Mccs):
-  @property
-  def brightness_both(self):
-    m, c = self.read(0x10)[1:]
+  async def get_brightness_both(self):
+    m, c = (await self.read(0x10))[1:]
     return c, m
 
-  @property
-  def brightness_max(self):
-    return self.read(0x10)[1]
+  async def get_brightness_max(self):
+    return (await self.read(0x10))[1]
 
-  @property
-  def brightness(self):
-    return self.read(0x10)[2]
+  async def get_brightness(self):
+    return (await self.read(0x10))[2]
 
-  @brightness.setter
-  def brightness(self, value):
-    return self.write(0x10, value)
+  async def set_brightness(self, value):
+    return await self.write(0x10, value)
+
+class TimingTest(object):
+  def __init__(self, monitor):
+    self.monitor = monitor
+
+  async def safe_check(self):
+    m = self.monitor
+    with m.safe_delay():
+      orig, mx = await m.get_brightness_both()
+      v = 1 if orig == 0 else orig - 1
+      await m.set_brightness(v)
+      assert await m.get_brightness() == v
+      await m.set_brightness(orig)
+      assert await m.get_brightness() == orig
+      return orig, mx
+
+  async def _test_read(self, repeat, mx, r, w):
+    m = self.monitor
+    with m.set_delay(r, w):
+      for i in range(repeat):
+        v = random.randint(0, mx)
+        await m.set_brightness(v)
+        try:
+          if await m.get_brightness() != v:
+            return False
+        except OSError:
+          return False
+    return True
+
+  async def _test_write(self, repeat, mx, r, w):
+    m = self.monitor
+    for i in range(repeat):
+      burst = random.randint(3, 8)
+      with m.set_delay(r, w):
+        for j in range(burst):
+          v = random.randint(0, mx)
+          await m.set_brightness(v)
+      with m.safe_delay():
+        if await m.get_brightness() != v:
+          return False
+    return True
+
+
+  async def _test(self, what, repeat, r, w):
+    orig, mx = await self.safe_check()
+    m = self.monitor
+    start = time.time()
+    testfunc = self._test_read if what == 'read' else self._test_write
+    result = await testfunc(repeat, mx, r, w)
+    with m.safe_delay():
+      await m.set_brightness(orig)
+      assert await m.get_brightness() == orig
+    print(f'{"SUCC" if result else "FAIL"} {what[0]} delay ({r}, {w}) took {time.time() - start} seconds')
+    return result
+
+  async def test(self):
+    r = 1.5 * await self.binary_search(0, .2, lambda r: self._test('read', 4, r, .2))
+    w = 1.5 * await self.binary_search(0, .2, lambda w: self._test('write', 4, r, w))
+    r = 1.2 * await self.binary_search(0, r, lambda r: self._test('read', 8, r, w))
+    w = 1.2 * await self.binary_search(0, w, lambda w: self._test('write', 8, r, w))
+    assert await self._test('write', 5, r, w)
+    assert await self._test('read', 5, r, w)
+    self.monitor.set_delay_permanently(r, w)
+
+  @staticmethod
+  async def binary_search(a, b, function):
+    good = b
+    bad = a
+    for i in range(5):
+      test_point = bad + (good - bad) / 2
+      result = await function(test_point)
+      if result:
+        good = test_point
+      else:
+        bad = test_point
+    return good
+
 
 class Edid(I2cDev):
   def __init__(self, **kwargs):
@@ -414,104 +489,21 @@ class Edid(I2cDev):
     return e
 
 
-class TimingTest(object):
-  def __init__(self, monitor):
-    self.monitor = monitor
-
-  def safe_check(self):
-    m = self.monitor
-    with m.safe_delay():
-      orig, mx = m.brightness_both
-      v = 1 if orig == 0 else orig - 1
-      m.brightness = v
-      assert m.brightness == v
-      m.brightness = orig
-      assert m.brightness == orig
-      return orig, mx
-
-  def _test_read(self, repeat, mx, r, w):
-    m = self.monitor
-    with m.set_delay(r, w):
-      for i in range(repeat):
-        v = random.randint(0, mx)
-        m.brightness = v
-        try:
-          if m.brightness != v:
-            return False
-        except OSError:
-          return False
-    return True
-
-  def _test_write(self, repeat, mx, r, w):
-    m = self.monitor
-    for i in range(repeat):
-      burst = random.randint(3, 8)
-      with m.set_delay(r, w):
-        for j in range(burst):
-          v = random.randint(0, mx)
-          m.brightness = v
-      with m.safe_delay():
-        if m.brightness != v:
-          return False
-    return True
-
-
-  def _test(self, what, repeat, r, w):
-    orig, mx = self.safe_check()
-    m = self.monitor
-    start = time.time()
-    testfunc = self._test_read if what == 'read' else self._test_write
-    result = testfunc(repeat, mx, r, w)
-    with m.safe_delay():
-      m.brightness = orig
-      assert m.brightness == orig
-    print(f'{"SUCC" if result else "FAIL"} {what[0]} delay ({r}, {w}) took {time.time() - start} seconds')
-    return result
-
-  def test(self):
-    r = 1.5 * self.binary_search(0, .2, lambda r: self._test('read', 4, r, .2))
-    w = 1.5 * self.binary_search(0, .2, lambda w: self._test('write', 4, r, w))
-    r = 1.2 * self.binary_search(0, r, lambda r: self._test('read', 8, r, w))
-    w = 1.2 * self.binary_search(0, w, lambda w: self._test('write', 8, r, w))
-    assert self._test('write', 5, r, w)
-    assert self._test('read', 5, r, w)
-    self.monitor.set_delay_permanently(r, w)
-
-  @staticmethod
-  def binary_search(a, b, function):
-    good = b
-    bad = a
-    for i in range(5):
-      test_point = bad + (good - bad) / 2
-      result = function(test_point)
-      if result:
-        good = test_point
-      else:
-        bad = test_point
-    return good
-
-
-class Monitor(MccsNamed):
-  def __init__(self, **kwargs):
-    self.edid = Edid(**kwargs).read_edid()
-    super().__init__(**kwargs)
-
-  @classmethod
-  def test(self, fname):
+async def main():
+  monitors = []
+  for dev_name in glob.glob('/dev/i2c-*'):
     try:
-      instance = self(file_name=fname)
+      edid = Edid(file_name=dev_name).read_edid()
     except IOError:
-      return None
+      continue
     else:
-      return instance
+      mon = MccsNamed(file_name=dev_name)
+      mon.edid = edid
+      monitors.append(mon)
 
-  @classmethod
-  def scan(self):
-    return [x for x in map(self.test, glob.glob('/dev/i2c-*')) if x]
+  for mon in monitors:
+    await TimingTest(mon).test()
 
 
 if __name__ == '__main__':
-  ms = Monitor.scan()
-  TimingTest(ms[0]).test()
-  m = Mccs(sys.argv[1])
-  print('Brightness', m.read(0x10))
+  trio.run(main)
