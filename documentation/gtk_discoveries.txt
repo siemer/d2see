@@ -1,0 +1,23 @@
+* I’m implementing a class derived from Gtk.Bin (class TestPattern(Gtk.Bin):)
+  * Bins are containers with one child
+  * I want to draw a background only
+  * background is just a fancy „frame“, one with greyscale bars
+  * the child should occupy the inner, smaller area of the space available
+* as a child of Gtk.Window I do receive early 'size-allocate' signal/call
+  * (in Gtk.Window derived class’ __init__(): self.add(TestPattern()))
+  * I do not get that call if I implement a `size_allocate()` function (tested)
+  * there is a default implementation, which seems to do:
+    * self.set_allocation(allocation ← from size_allocate call argument)
+      * seems to be „only“ for later self.get_allocation() calls to know the allowcation
+        in different parts of the instance – as the name suggests
+  * I do get the call if I implement a `do_size_allocate()` function (tested)
+    * and then the default implementation will not be called (tested)
+      * because in `do_draw()` `self.get_allocation()` will stop reporting anything else
+        than 1x1
+  * you can catch the 'event' with `self.connect('size-allocate', self.handler)`
+    `handler()` will be called with self as the first argument
+    * the default implementation is still run this way
+    * singal connected handler is called after `do_size_allocate()` if both exist
+      * the signal story is pretty long; I found a good intro online;
+        if it is called first or last depends on the signal, I believe
+    
