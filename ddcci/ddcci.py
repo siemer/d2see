@@ -19,16 +19,18 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 '''
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 import fcntl
 import functools
 import glob
+import itertools
 import operator
 import os
 import random
-import sys
 import time
 
 import trio
+from ddcci import xdg
 
 # 1 i2c messages
 # 2 i2c-dev messages
@@ -252,9 +254,8 @@ def printbytes(template, *args):
   print(template.format(*strings))
 
 
-class I2cDev(object):
-  def __init__(self, file_name, i2c_slave_addr, **kwargs):
-    super().__init__(**kwargs)
+class I2cDev:
+  def __init__(self, file_name, i2c_slave_addr):
     self._dev = os.open(file_name, os.O_RDWR)
     fcntl.ioctl(self._dev, 0x0703, i2c_slave_addr)  # CPP macro: I2C_SLAVE
 
@@ -264,100 +265,234 @@ class I2cDev(object):
     return ba
 
   def write(self, *args, **kwargs):
-    printbytes('write: {}', args[0])
+    # printbytes('write: {}', args[0])
     return os.write(self._dev, *args, **kwargs)
+
+class EdidDevice:
+  def __init__(self, file_name):
+    dev = I2cDev(file_name=file_name, i2c_slave_addr=0x50)
+    candidate = dev.read(512)  # current position unknown to us
+    start = candidate.find(bytes.fromhex('00 FF FF FF FF FF FF 00'))
+    if start < 0:
+      raise IOError()
+    edid = candidate[start:start+256]
+    manu_code = int.from_bytes(edid[8:10], 'big')
+    manufacturer = ''
+    for i in range(3):
+      manufacturer = chr(ord('A') - 1 + (manu_code & 0b11111)) + manufacturer
+      manu_code >>= 5
+    self.edid256 = edid  # always 256 bytes long even for 128 byte EDIDs
+    self.edid_id = manufacturer + edid[10:18].hex()  # PC/SN, manufacturing date
+    self.file_name = file_name
+
+  @classmethod
+  def match_edids(cls, monitor):
+      for edev in cls.devices:
+        if edev.edid256.startswith(monitor.edid):
+          cls.device.remove(edev)
+          monitor.init_with_ediddev(edev)
+
 
 class CrappyHardwareError(IOError):
   pass
 
-class Ddcci(I2cDev):
-  def __init__(self, **kwargs):
-    kwargs['i2c_slave_addr'] = 0x37
-    super().__init__(**kwargs)
-    self.waiter = Waiter(.2, .2)
+@dataclass
+class WouldBlockTime(Exception):
+  wait_time: int
+
+def async_version_of(method):
+  async def async_method(*args, **kwargs):
+    while True:
+      try:
+        res = method(*args, **kwargs)
+      except WouldBlockTime as e:
+        await trio.sleep(e.wait_time)
+        continue
+      else:
+        return res
+  return async_method
+
+class Ddcci:
+  def __init__(self, *, file_name, open_config):
+    self.waiter = Waiter(open_config)
+    self._dev = I2cDev(i2c_slave_addr=0x37, file_name=file_name)
     self.set_delay = self.waiter.set_delay
     self.safe_delay = self.waiter.safe_delay
-    self.set_delay_permanently = self.waiter.set_delay_permanently
 
-  async def write(self, *args):
+  def write_nowait(self, *args):
+    self.waiter.ensure_waited('w')
     ba = bytearray(args)
     ba.insert(0, len(ba) | 0x80)
     ba.insert(0, 0x51)
     ba.append(functools.reduce(operator.xor, ba, 0x6e))
-    await self.waiter.wait('w')
-    return I2cDev.write(self, ba)
+    res = self._dev.write(ba)
+    self.waiter.set_last('w')
+    return res
+
+  write = async_version_of(write_nowait)
 
   @staticmethod
   def check_read_bytes(ba):
+    chk_calc = functools.reduce(operator.xor, ba)
     checks = {
       'source address': ba[0] == 0x6e,
-      'checksum': functools.reduce(operator.xor, ba) == 0x50,
+      f'checksum {chk_calc}': chk_calc == 0x50,
       'length': len(ba) >= (ba[1] & ~0x80) + 3
         }
     if False in checks.values():
       raise IOError(checks)
 
-  async def read(self, amount):
-    await self.waiter.wait('r')
-    b = I2cDev.read(self, amount + 3)
-    if not [i for i in b if i]:
+  def read_nowait(self, amount, *, compensate=False):
+    self.waiter.ensure_waited('r')
+    length = amount + 3
+    b = self._dev.read(length)
+    self.waiter.set_last('r')
+    leading_zeros = len(list(itertools.takewhile(lambda x: x == 0, b)))
+    if leading_zeros == length:
       raise CrappyHardwareError()
+    elif leading_zeros and compensate:
+      print(f'Compensating {leading_zeros} zeros.')
+      b2 = self._dev.read(leading_zeros + 5)
+      b = b[leading_zeros:] + b2[:leading_zeros]
     Ddcci.check_read_bytes(b)
-    return b[2:-1]
+    b = b[2:-1]
+    return b
 
-class Waiter(object):
-  def __init__(self, *args, **kwargs):
+  read = async_version_of(read_nowait)
+
+class Waiter:
+  def __init__(self, open_config):
+    self.open_config = open_config
     self.last_which = 'r'
     self.last_when = 0
-    self.set_delay_permanently(*args, **kwargs)
+    default_delay = False
+    with open_config() as file:
+      rw_delays = []
+      for _ in range(2):
+        try:
+          f = float(file.readline())
+        except ValueError:
+          f = .2
+          default_delay = True
+        rw_delays.append(f)
+    self._set_delay_permanently(*rw_delays)
+    self._default_delay = default_delay
 
-  def set_delay_permanently(self, r, w):
-    self._calc_delays(dict(r=r, w=w))
+  def has_default_delay(self):
+    return self._default_delay
+
+  def _write_config(self):
+    with self.open_config(mode='w') as file:
+      for float_val in self.delays_raw:
+        file.write(f'{float_val}\n')
+
+  def remove_default_delays(self, rw_delays):
+      self._set_delay_permanently(*rw_delays)
+      self._write_config()
+      self._default_delay = False
+
+  def _set_delay_permanently(self, r, w):
+    self._set_internal(dict(r=r, w=w))
 
   @contextmanager
   def set_delay(self, *args, **kwargs):
     saved_delays = self.delays_raw
-    self.set_delay_permanently(*args, **kwargs)
+    self._set_delay_permanently(*args, **kwargs)
     try:
       yield
     finally:
-      self._calc_delays(saved_delays)
+      self._set_internal(saved_delays)
 
   def safe_delay(self):
     return self.set_delay(.2, .2)
 
-  def _calc_delays(self, raw):
+  def _set_internal(self, raw):
     self.delays_raw = raw
     self.delays = dict(wr=raw['r'], ww=raw['w'], rr=0)
     self.delays['rw'] = max(*raw.values())
     print(self.delays)
 
-  async def wait(self, which):
+  def ensure_waited(self, which):
     assert which in ('r', 'w')
     succession = self.last_which + which
     wait_time = self.last_when + self.delays[succession] - time.time()
-    print(f'{succession}: {wait_time}s')
-    if wait_time > 0:
-      await trio.sleep(wait_time)
+    # print(f'{succession}: {wait_time}s')
+    wait_time = max(0, wait_time)
+    if wait_time:
+      raise WouldBlockTime(wait_time)
+
+  def set_last(self, which):
     self.last_when = time.time()
     self.last_which = which
 
 
-class Mccs(Ddcci):
-  async def write(self, vcpopcode, value):
-    return await Ddcci.write(self, 0x03, vcpopcode, *value.to_bytes(2, 'big'))
+def invalidate_read_preparation(method):
+  def new_method(self, *args, **kwargs):
+    try:
+      res = method(self, *args, **kwargs)
+    except WouldBlockTime:
+      # either we didn't do anything
+      # or we prepared a read in which case attribte was made valid
+      raise
+    except:
+      # could be anything → invalidate
+      self._read_vcpopcode = None
+      raise
+    else:
+      # successful read/write → invalidate
+      self._read_vcpopcode = None
+      return res
+  return new_method
 
-  async def read(self, vcpopcode):
-    for i in range(2):
-      await Ddcci.write(self, 0x01, vcpopcode)
+def returns_cancel_scope(afunc):
+  async def f(*args, task_status=trio.TASK_STATUS_IGNORED, **kwargs):
+    with trio.CancelScope() as cs:
+      task_status.started(cs)
+      return await afunc(*args, **kwargs)
+  return f
+
+def try_again(afunc):
+  async def new_afunc(*args, **kwargs):
+    for iteration in reversed(range(2)):
       try:
-        b = await Ddcci.read(self, 8)
+        res = await afunc(*args, **kwargs)
       except CrappyHardwareError:
-        print('Retrying read() operation.')
-        b = bytes(8)
-        continue
+        if iteration == 0:
+          raise
+        else:
+          continue
       else:
         break
+    return res
+  return new_afunc
+
+
+class Mccs:
+  def __init__(self, *, file_name, open_config):
+    self._ddcci = Ddcci(file_name=file_name, open_config=open_config)
+    self._read_vcpopcode = None
+    self.safe_delay = self._ddcci.safe_delay
+    self.set_delay = self._ddcci.set_delay
+
+  async def optimize_delays(self):
+    if self._ddcci.waiter.has_default_delay():
+      rw_delays = await TimingTest(self).determine_delays()
+      self._ddcci.waiter.remove_default_delays(rw_delays)
+    else:
+      await trio.sleep(0)
+
+  @invalidate_read_preparation
+  def write_nowait(self, vcpopcode, value):
+    return self._ddcci.write_nowait(0x03, vcpopcode, *value.to_bytes(2, 'big'))
+
+  write = async_version_of(write_nowait)
+
+  @invalidate_read_preparation
+  def read_nowait(self, vcpopcode, *, compensate=False):
+    if self._read_vcpopcode != vcpopcode:
+      self._ddcci.write_nowait(0x01, vcpopcode)
+      self._read_vcpopcode = vcpopcode
+    b = self._ddcci.read_nowait(8, compensate=compensate)
     checks = {
       'is feature reply': b[0] == 0x02,
       'supported VCP opcode': b[1] == 0,
@@ -365,34 +500,197 @@ class Mccs(Ddcci):
         }
     if False in checks.values():
       raise IOError(checks)
-    return b[3], int.from_bytes(b[4:6], 'big'), int.from_bytes(b[6:8], 'big')
+    # present value, max value, VCP type code (0 == Set parameter, 1 = Momentary)?!?
+    return int.from_bytes(b[6:8], 'big'), int.from_bytes(b[4:6], 'big'), b[3]
 
-  async def flush(self):
-    return await Ddcci.write(self, 0x0c)
+  read = async_version_of(read_nowait)
 
-  async def capabilities(self):
-    await Ddcci.write(self, 0xf3, 0, 0)
+  @invalidate_read_preparation
+  def flush_nowait(self):
+    return self._ddcci.write(0x0c)
+
+  @invalidate_read_preparation
+  def capabilities_nowait(self):
+    self._ddcci.write(0xf3, 0, 0)
     # ...
 
-  async def timing(self):
-    await Ddcci.write(self, 0x07)
-    return await Ddcci.read(self, 6)
+  @invalidate_read_preparation
+  def timing_nowait(self):
+    self._ddcci.write(0x07)
+    return self._ddcci.read(6)
 
-class MccsNamed(Mccs):
+  @try_again
   async def get_brightness_both(self):
-    m, c = (await self.read(0x10))[1:]
+    c, m, _ = (await self.read(0x10))
     return c, m
 
+  @try_again
   async def get_brightness_max(self):
     return (await self.read(0x10))[1]
 
+  @try_again
   async def get_brightness(self):
     return (await self.read(0x10))[2]
 
+  @returns_cancel_scope
   async def set_brightness(self, value):
     return await self.write(0x10, value)
 
-class TimingTest(object):
+
+@dataclass
+class Setting:
+  register: int
+  current_value: int = None  # suspected or confirmed value in monitor
+  new_value: int = None  # value to be sent to monitor
+  confirmed: bool = False  # current_value is really in hardware
+  writings_left: int = 0  # write several times, before even checking
+  writing_cycles = 2  # how often we write to hw before checking
+  max: int = None  # maximum allowed value according to monitor
+  write_time: int = 0  # only req: later time is bigger number (monitor global)
+
+  def set(self, value, max):
+    '''Set fields according to hardware read real values.
+    Part of the interface to hardware handling code.
+    Is either used on first initial hardware read for this setting or
+    for the confirmation hardware read after several writes.'''
+    if self.current_value is None:
+      # initial hw read
+      self.max = max
+    elif self.new_value != value:
+      # writings did not succeed
+      self.writings_left = Setting.writing_cycles
+      print(f'Control read returned unexpected value {value}. Expected {self.new_value}.')
+    else:
+      # writing worked fine
+      assert self.max == max
+      assert self.writings_left == 0
+    self.current_value = value
+    self.confirmed = True
+
+  def ack_write(self, time):
+    '''Update fields in case self.new_value is written to hardware.
+    Part of the interface to hardware handling code.'''
+    self.current_value = self.new_value
+    self.confirmed = False
+    self.write_time = time
+    if self.writings_left >= 1:
+      self.writings_left -= 1
+    else:
+      self.writings_left = 0
+
+  def write(self, value):
+    '''Set write wish in fields.
+    Part of the interface to users of Setting.'''
+    if self.new_value == value:
+      # same write is already underway
+      return False
+    else:
+      self.new_value = value
+      self.writings_left = Setting.writing_cycles
+      return True
+
+  def read(self):
+    '''Return best knowledge of the Setting. Raises exception if it
+    wasn’t initialized.
+    Part of the interface to users of Setting.'''
+    if self.current_value is not None:
+      return self.current_value
+    else:
+      raise RuntimeError('Can’t guess Setting which was never properly initialized.')
+
+  def done(self):
+    return self.confirmed and self.writings_left == 0
+
+  @staticmethod
+  def cmp_key(i):
+    if i.current_value is None:
+      # initial hardware reads get highest priority
+      return (Setting.writing_cycles + 1,)
+    elif i.writings_left == 0:
+      # some control reads left
+      return (0, -i.confirmed, -i.write_time)
+    else:
+      # write task
+      return (i.writings_left, -i.write_time)
+
+class MonitorController:
+  def __init__(self, edid_device):
+    self.edid_device = edid_device
+    self.open_config = functools.partial(xdg.open_config,
+        f'd2see/{edid_device.edid_id}')
+    self._mccs = Mccs(file_name=edid_device.file_name, open_config = self.open_config)
+    self.settings = dict()
+    for reg in 0x10,:
+      self.settings[reg] = Setting(reg)
+    self.initialized = trio.Event()
+    self._waiting_for_task = trio.Event()
+    self._new_task_available = trio.Event()
+    self._time = 0  # increments on each write; good enough for ack_write()
+
+  @staticmethod
+  def coldplug():
+    edid_datas = set()
+    mcs = []
+    for dev_name in glob.glob('/dev/i2c-*'):
+      try:
+        edid_device = EdidDevice(dev_name)
+      except IOError:
+        continue
+      else:
+        mc = MonitorController(edid_device=edid_device)
+        mcs.append(mc)
+        if edid_device.edid256 in edid_datas:
+          print('Monitors with the same EDID found. ' \
+                'This will probably mess things up.')
+        else:
+          edid_datas.add(edid_device.edid256)
+    return mcs
+
+  async def _next_task(self):
+    # if a setting is not .done() it dual functions as a task as well
+    while True:
+      s = max(self.settings.values(), key=Setting.cmp_key)
+      if s.done():
+        self.initialized.set()  # effectively set when tasks from __init__() are .done()
+        self._waiting_for_task.set()
+        await self._new_task_available.wait()
+        self._waiting_for_task = trio.Event()
+      else:
+        return s
+
+  def read(self, register):
+    return self.settings[register].read()
+
+  def write(self, register, value):
+    if self.settings[register].write(value):
+      if self._waiting_for_task.is_set():
+        self._new_task_available.set()
+        self._new_task_available = trio.Event()
+
+  async def handle_tasks(self):
+    await self._mccs.optimize_delays()
+    while True:
+      task = await self._next_task()
+      if task.writings_left > 0:
+        try:
+          self._mccs.write_nowait(task.register, task.new_value)
+        except WouldBlockTime as e:
+          await trio.sleep(e.wait_time)
+        else:
+          self._time += 1
+          task.ack_write(self._time)
+      else:
+        try:
+          c, m, _ = self._mccs.read_nowait(task.register, compensate=True)
+        except WouldBlockTime as e:
+          await trio.sleep(e.wait_time)
+        except IOError:
+          print('Control read unsuccessful.')
+        else:
+          task.set(c, m)
+
+
+class TimingTest:
   def __init__(self, monitor):
     self.monitor = monitor
 
@@ -407,21 +705,29 @@ class TimingTest(object):
       assert await m.get_brightness() == orig
       return orig, mx
 
-  async def _test_read(self, repeat, mx, r, w):
+  def _tokens_repeat(self, failure_rate, tokens=1):
+    return tokens, round(tokens / failure_rate)
+
+  async def _test_read(self, failure_rate, mx, r, w):
     m = self.monitor
+    tokens, repeat = self._tokens_repeat(failure_rate)
     with m.set_delay(r, w):
       for i in range(repeat):
         v = random.randint(0, mx)
         await m.set_brightness(v)
         try:
           if await m.get_brightness() != v:
-            return False
+            if not tokens:
+              return False
+            else:
+              tokens -= 1
         except OSError:
           return False
     return True
 
-  async def _test_write(self, repeat, mx, r, w):
+  async def _test_write(self, failure_rate, mx, r, w):
     m = self.monitor
+    tokens, repeat = self._tokens_repeat(failure_rate)
     for i in range(repeat):
       burst = random.randint(3, 8)
       with m.set_delay(r, w):
@@ -430,30 +736,29 @@ class TimingTest(object):
           await m.set_brightness(v)
       with m.safe_delay():
         if await m.get_brightness() != v:
-          return False
+          if not tokens:
+            return False
+          else:
+            tokens -= 1
     return True
 
-
-  async def _test(self, what, repeat, r, w):
+  async def _test(self, what, failure_rate, r, w):
     orig, mx = await self.safe_check()
     m = self.monitor
     start = time.time()
     testfunc = self._test_read if what == 'read' else self._test_write
-    result = await testfunc(repeat, mx, r, w)
-    with m.safe_delay():
-      await m.set_brightness(orig)
-      assert await m.get_brightness() == orig
+    result = await testfunc(failure_rate, mx, r, w)
     print(f'{"SUCC" if result else "FAIL"} {what[0]} delay ({r}, {w}) took {time.time() - start} seconds')
     return result
 
-  async def test(self):
-    r = 1.5 * await self.binary_search(0, .2, lambda r: self._test('read', 4, r, .2))
-    w = 1.5 * await self.binary_search(0, .2, lambda w: self._test('write', 4, r, w))
-    r = 1.2 * await self.binary_search(0, r, lambda r: self._test('read', 8, r, w))
-    w = 1.2 * await self.binary_search(0, w, lambda w: self._test('write', 8, r, w))
-    assert await self._test('write', 5, r, w)
-    assert await self._test('read', 5, r, w)
-    self.monitor.set_delay_permanently(r, w)
+  async def determine_delays(self):
+    r = 1.5 * await self.binary_search(0, .2, lambda r: self._test('read', .1, r, .2))
+    w = 1.5 * await self.binary_search(0, .2, lambda w: self._test('write', .1, r, w))
+    r = 1.2 * await self.binary_search(0, r, lambda r: self._test('read', .1, r, w))
+    w = 1.2 * await self.binary_search(0, w, lambda w: self._test('write', .1, r, w))
+    # assert await self._test('write', .1, r, w)
+    # assert await self._test('read', .1, r, w)
+    return (r, w)
 
   @staticmethod
   async def binary_search(a, b, function):
@@ -467,43 +772,3 @@ class TimingTest(object):
       else:
         bad = test_point
     return good
-
-
-class Edid(I2cDev):
-  def __init__(self, **kwargs):
-    kwargs['i2c_slave_addr'] = 0x50
-    super().__init__(**kwargs)
-
-  def read_edid(self):
-    candidate = I2cDev.read(self, 512)  # current position unknown to us
-    start = candidate.find(bytes.fromhex('00 FF FF FF FF FF FF 00'))
-    if start < 0:
-      raise IOError()
-    e = candidate[start:start+256]
-    manufacturer = int.from_bytes(e[8:10], 'big')
-    m = ''
-    for i in range(3):
-      m = chr(ord('A') - 1 + (manufacturer & 0b11111)) + m
-      manufacturer >>= 5
-    printbytes('{} P/C S/N {}, week/year {}, EDID ver. {}', m, e[10:16], e[16:18], e[18:20])
-    return e
-
-
-async def main():
-  monitors = []
-  for dev_name in glob.glob('/dev/i2c-*'):
-    try:
-      edid = Edid(file_name=dev_name).read_edid()
-    except IOError:
-      continue
-    else:
-      mon = MccsNamed(file_name=dev_name)
-      mon.edid = edid
-      monitors.append(mon)
-
-  for mon in monitors:
-    await TimingTest(mon).test()
-
-
-if __name__ == '__main__':
-  trio.run(main)
