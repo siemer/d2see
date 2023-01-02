@@ -1,62 +1,87 @@
 #!/usr/bin/python3
 
 import gi
+import trio
+import trio_gtk
+
 gi.require_version('Gtk', '3.0')
+
 from gi.repository import Gtk, Gdk
+
+from ddcci import ddcci
 
 class TestPattern(Gtk.Bin):
     def __init__(self, *args, **kwargs):
         super().__init__()
 
     def do_size_allocate(self, allocation):
-        print("do_size_allocate()")
         self.set_allocation(allocation)
-        self.margin = 10
-        self.steps4x = 20
-        self.steps4y = 8
-        calc_step = lambda total, steps: (total - 2*self.margin) // steps
-        self.xstep = calc_step(allocation.width, self.steps4x)
-        self.ystep = calc_step(allocation.height, self.steps4y)
+        width, height = allocation.width, allocation.height
+        print("do_size_allocate() FUNCTION, width:", width)
+        smaller_dim = min(width, height)
+        if smaller_dim > 800:
+            self.square_size = 80
+            self.margin = 20
+        else:
+            self.square_size = max(40, smaller_dim/10)
+            self.margin = 10
+        def step_amount(dim_size):
+            nr = round((dim_size - 2 * self.margin) / self.square_size)
+            return max(min(20, nr), 7)
+        self.steps4x = step_amount(width)
+        self.steps4y = step_amount(height)
+        def step_size(dim, steps):
+            return (dim - 2*self.margin - 2*self.square_size) / (steps - 2)
+        self.xstep = step_size(width, self.steps4x)
+        self.ystep = step_size(height, self.steps4y)
 
         r = Gdk.Rectangle()
-        r.x = 2 * self.margin + self.xstep
-        r.y = 2 * self.margin + self.ystep
-        r.width = allocation.width - 2 * r.x
-        r.height = allocation.height - 2 * r.y
+        r.x = r.y = 2 * self.margin + self.square_size
+        r.width = width - 2 * r.x
+        r.height = height - 2 * r.y
         self.get_child().size_allocate(r)
 
-    def draw_square(self, c, x0, y0, xstep, ystep, color):
+    def draw_square(self, c, x0, y0, x1, y1, color):
         c.set_source_rgb(color, color, color)
-        x1 = x0 + xstep
-        y1 = y0 + ystep
+        x0 = round(x0)
+        x1 = round(x1)
+        y0 = round(y0)
+        y1 = round(y1)
         c.move_to(x0, y0)
         c.line_to(x1, y0)
         c.line_to(x1, y1)
         c.line_to(x0, y1)
         c.fill()
 
-    def draw_segment(self, c, x0, y0, xstep, ystep, xdir, ydir, start_color):
+    def draw_segment(self, c, x0, y0, xdir, ydir, start_color):
         assert 0 in (xdir, ydir)
         steps = self.steps4x if xdir else self.steps4y
         color_step = 1 / (steps - 1)
         if start_color == 1:
             color_step *= -1
         # as we draw overlapping segments, I can skip the last one...
-        for i in range(steps - 1):
-            self.draw_square(c, x0, y0, xstep, ystep, start_color+color_step*i)
+        for i in range(steps):
+            if i in (0, steps-1):
+                xstep = ystep = self.square_size
+            elif xdir:
+                xstep = self.xstep
+            else:
+                ystep = self.ystep
+            self.draw_square(c, x0, y0, x0+xstep, y0+ystep, start_color+color_step*i)
             x0 += xdir * xstep
             y0 += ydir * ystep
 
-    def draw_segments(self, c, w, h):
+    def draw_segments(self, c):
         x0 = y0 = self.margin
-        def draw(x, y, xdir, ydir, start_color):
-            self.draw_segment(c, x, y, self.xstep, self.ystep, xdir, ydir, start_color)
-        x1 = x0 + (self.steps4x - 1) * self.xstep
-        y1 = y0 + (self.steps4y - 1) * self.ystep
+        def xy1(xy0, step_amount, step_size):
+            return xy0 + self.square_size + (step_amount-2) * step_size
+        x1 = xy1(x0, self.steps4x, self.xstep)
+        y1 = xy1(y0, self.steps4y, self.ystep)
+        draw = lambda *args, **kwargs: self.draw_segment(c, *args, **kwargs)
         draw(x0, y0, 1, 0, 0)
+        draw(x0, y0, 0, 1, 0)
         draw(x1, y0, 0, 1, 1)
-        draw(x1, y1, -1, 0, 0)
-        draw(x0, y1, 0, -1, 1)
+        draw(x0, y1, 1, 0, 1)
 
     def do_draw(self, c):
         allocation = self.get_allocation()
@@ -66,23 +91,39 @@ class TestPattern(Gtk.Bin):
 
         c.set_source_rgb(1, 1, 1)
         c.paint()
-        self.draw_segments(c, w, h)
+        self.draw_segments(c)
         self.propagate_draw(self.get_child(), c)
 
 
+class BrightnessScale(Gtk.Scale):
+    def __init__(self, monitor_settings):
+        super().__init__()
+        self._monitor_settings = ms = monitor_settings
+        print(ms._monitor._ddcci.edid_id)
+        self.set_digits(0)
+        self.set_range(0, ms.settings[0x10].max)
+        self.set_increments(-5, 5)
+        self.connect('value-changed', self.set_brightness)
+
+    def set_brightness(self, _):
+        v = round(self.get_value())
+        self._monitor_settings.write(0x10, v)
+
 class PatternWindow(Gtk.Window):
-    def __init__(self):
+    def __init__(self, monitor_controller, desktop_index):
         super().__init__(title='d2see test pattern')
         main = TestPattern()
         box = Gtk.VBox()
         label = Gtk.Label(label='Hello!')
-        bb = Gtk.ButtonBox()
-        b_close = Gtk.Button(label='Close')
+        button_box = Gtk.ButtonBox()
+        button_close = Gtk.Button(label='Close')
+        scale = BrightnessScale(monitor_controller)
         self.add(main)
         main.add(box)
         box.pack_start(label, True, True, 0)
-        box.add(bb)
-        bb.add(b_close)
+        box.add(button_box)
+        button_box.add(scale)
+        button_box.add(button_close)
         style_provider = Gtk.CssProvider()
         style_provider.load_from_data(b'''
             * { color: #ff0077;
@@ -91,9 +132,21 @@ class PatternWindow(Gtk.Window):
         self.get_style_context().add_provider(style_provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-        b_close.connect('clicked', lambda w: self.hide())
+        button_close.connect('clicked', Gtk.main_quit)
+        self.connect('delete-event', Gtk.main_quit)
+        self.connect('realize', self.realized)
+        self.show_all()
+
+    def my_show(self):
+        w.realize()
+        w.show_all()
+        gw = w.get_window()
+        gw.move_to_desktop(d)
+        w.fullscreen()
+
+
+async def main():
+    pass
 
 if __name__ == '__main__':
-    w = PatternWindow()
-    w.show_all()
-    Gtk.main()
+    trio_gtk.run(main)
