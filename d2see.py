@@ -1,13 +1,21 @@
 #!/usr/bin/python3
 
+import functools
 import inspect
 import re
+
+import ewmh
 import gi
-
-from ddcci import ddcci
-
+import trio
+import trio_gtk
+import Xlib.display
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GdkX11
+
+from ddcci import ddcci
+import testpattern
+import xdg
+
 
 def gtext(text):
     return gtext.single_nl.sub(' ', inspect.cleandoc(text))
@@ -75,10 +83,7 @@ class Assistant(Gtk.Assistant):
 
 
 class Model(object):
-    def scan(self):
-        self.edids = ddcci.Edid.scan()
-        self.x_display = xd = GdkX11.X11Display.get_default()
-        self.x_monitors = [xd.get_monitor(i) for i in range(xd.get_n_monitors())]
+    pass
         # On i3 I can only create a window on each desktop, because the move
         # operations don't work.
         # x_window = window.get_window()
@@ -86,9 +91,45 @@ class Model(object):
         # x_window.get_desktop()
         # GdkX11.X11Screen.get_default().get_number_of_desktops()
 
+def create_windows(monitor_controllers):
+    monitor_controllers = monitor_controllers.copy()
+    display = Xlib.display.Display()
+    root = display.screen().root
+    edid_atom = display.get_atom('EDID')
+    windows = []
+    for randr_monitor in root.xrandr_get_monitors().monitors:
+        # sth like 'HDMI-0' or self-selected name on virtual monitors
+        connector_name = display.get_atom_name(randr_monitor.name)
+        matching_controllers = []
+        # output and crtcs are different, but here it seems we get the outputs
+        for output in randr_monitor.crtcs:  # virtual mons might span more than one
+            assert edid_atom in display.xrandr_list_output_properties(output).atoms
+            randr_edid = bytes(display.xrandr_get_output_property(output, edid_atom, 0, 0, 64).value)
+            edid_match = lambda mc, re: mc.edid_device.edid256.startswith(re)
+            mc = next(mc for mc in monitor_controllers if edid_match(mc, randr_edid))
+            monitor_controllers.remove(mc)
+            matching_controllers.append(mc)
+        viewports = ewmh.EWMH().getDesktopViewPort()
+        for desktop_index, (x, y) in enumerate(zip(viewports[0::2], viewports[1::2])):
+            if (randr_monitor.x, randr_monitor.y) == (x, y):
+                windows.append(testpattern.TestPattern(matching_controllers, desktop_index))
+    return windows
 
+async def main():
+    mcs = ddcci.MonitorController.coldplug()
+    async with trio.open_nursery() as nursery:
+        for mon in mcs:
+            nursery.start_soon(mon.handle_tasks)
+        for mon in mcs:
+            await mon.initialized.wait()
+        PatternWindow(mon)
 
-win = Assistant()
-win.connect('destroy', Gtk.main_quit)
-win.show_all()
-Gtk.main()
+    await trio.sleep_forever()
+
+if __name__ is '__main__':
+    trio_gtk.run(main)
+
+# win = Assistant()
+# win.connect('destroy', Gtk.main_quit)
+# win.show_all()
+# Gtk.main()
