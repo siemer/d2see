@@ -81,16 +81,6 @@ class Assistant(Gtk.Assistant):
 
         return page_nr + 1
 
-
-class Model(object):
-    pass
-        # On i3 I can only create a window on each desktop, because the move
-        # operations don't work.
-        # x_window = window.get_window()
-        # x_window.move_to_desktop(int)
-        # x_window.get_desktop()
-        # GdkX11.X11Screen.get_default().get_number_of_desktops()
-
 def create_windows(monitor_controllers):
     monitor_controllers = monitor_controllers.copy()
     display = Xlib.display.Display()
@@ -112,24 +102,15 @@ def create_windows(monitor_controllers):
         viewports = ewmh.EWMH().getDesktopViewPort()
         for desktop_index, (x, y) in enumerate(zip(viewports[0::2], viewports[1::2])):
             if (randr_monitor.x, randr_monitor.y) == (x, y):
-                windows.append(testpattern.TestPattern(matching_controllers, desktop_index))
+                windows.append(testpattern.PatternWindow(matching_controllers, desktop_index))
     return windows
 
 async def main():
-    mcs = ddcci.MonitorController.coldplug()
     async with trio.open_nursery() as nursery:
-        for mon in mcs:
-            nursery.start_soon(mon.handle_tasks)
+        mcs = ddcci.MonitorController.coldplug(nursery)
         for mon in mcs:
             await mon.initialized.wait()
-        PatternWindow(mon)
-
-    await trio.sleep_forever()
+        create_windows(mcs)
 
 if __name__ is '__main__':
     trio_gtk.run(main)
-
-# win = Assistant()
-# win.connect('destroy', Gtk.main_quit)
-# win.show_all()
-# Gtk.main()

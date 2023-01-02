@@ -110,40 +110,37 @@ class BrightnessScale(Gtk.Scale):
         self._monitor_settings.write(0x10, v)
 
 class PatternWindow(Gtk.Window):
-    def __init__(self, monitor_controller, desktop_index):
+    def __init__(self, monitor_controllers, desktop_index):
         super().__init__(title='d2see test pattern')
+        self.desktop_index = desktop_index
+        self.connect('delete-event', Gtk.main_quit)
+        self.connect('realize', self.realized)
         main = TestPattern()
         box = Gtk.VBox()
         label = Gtk.Label(label='Hello!')
         button_box = Gtk.ButtonBox()
         button_close = Gtk.Button(label='Close')
-        scale = BrightnessScale(monitor_controller)
+        button_close.connect('clicked', Gtk.main_quit)
+        scale = BrightnessScale(monitor_controllers[0])
         self.add(main)
         main.add(box)
         box.pack_start(label, True, True, 0)
         box.add(button_box)
         button_box.add(scale)
         button_box.add(button_close)
-        style_provider = Gtk.CssProvider()
-        style_provider.load_from_data(b'''
-            * { color: #ff0077;
-            background-color: #ffffff }
-        ''')
-        self.get_style_context().add_provider(style_provider,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-
-        button_close.connect('clicked', Gtk.main_quit)
-        self.connect('delete-event', Gtk.main_quit)
-        self.connect('realize', self.realized)
+        # style_provider = Gtk.CssProvider()
+        # style_provider.load_from_data(b'''
+        #     * { color: #ff0077;
+        #     background-color: #ffffff }
+        # ''')
+        # self.get_style_context().add_provider(style_provider,
+        #     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.show_all()
 
-    def my_show(self):
-        w.realize()
-        w.show_all()
-        gw = w.get_window()
-        gw.move_to_desktop(d)
-        w.fullscreen()
-
+    def realized(self, self2):
+        # other move ops don’t work on i3 window manager
+        self.get_window().move_to_desktop(self.desktop_index)
+        self.fullscreen()
 
 async def main():
     pass

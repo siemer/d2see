@@ -37,16 +37,3 @@ for crtc in sres.crtcs:
 gr = Gdk.get_default_root_window()
 gd = gr.get_display()
 gs = gd.get_default_screen()
-
-sys.exit()
-
-for d in range(gs.get_number_of_desktops()):
-    w = Gtk.Window()
-    w.realize()
-    w.show_all()
-    gw = w.get_window()
-    gw.move_to_desktop(d)
-    w.fullscreen()
-
-Gtk.main()
-

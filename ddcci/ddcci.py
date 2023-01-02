@@ -628,7 +628,7 @@ class MonitorController:
     self._time = 0  # increments on each write; good enough for ack_write()
 
   @staticmethod
-  def coldplug():
+  def coldplug(nursery):
     edid_datas = set()
     mcs = []
     for dev_name in glob.glob('/dev/i2c-*'):
@@ -638,6 +638,7 @@ class MonitorController:
         continue
       else:
         mc = MonitorController(edid_device=edid_device)
+        nursery.start_soon(mc.handle_tasks)
         mcs.append(mc)
         if edid_device.edid256 in edid_datas:
           print('Monitors with the same EDID found. ' \
