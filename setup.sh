@@ -8,3 +8,4 @@ pip install wheel  # otherwise trio-gtk does not install
 # apt libcairo2-dev was required for pip pycairo
 # and then this for trio-gtk: sudo apt install libgirepository1.0-dev
 pip install trio-gtk
+pip install ewmh

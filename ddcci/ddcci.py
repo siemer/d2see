@@ -265,7 +265,7 @@ class I2cDev:
     return ba
 
   def write(self, *args, **kwargs):
-    # printbytes('write: {}', args[0])
+    printbytes('write: {}', args[0])
     return os.write(self._dev, *args, **kwargs)
 
 class EdidDevice:
@@ -383,7 +383,7 @@ class Waiter:
 
   def _write_config(self):
     with self.open_config(mode='w') as file:
-      for float_val in self.delays_raw:
+      for float_val in self.delays_raw.values():
         file.write(f'{float_val}\n')
 
   def remove_default_delays(self, rw_delays):
@@ -530,7 +530,7 @@ class Mccs:
 
   @try_again
   async def get_brightness(self):
-    return (await self.read(0x10))[2]
+    return (await self.read(0x10))[0]
 
   @returns_cancel_scope
   async def set_brightness(self, value):

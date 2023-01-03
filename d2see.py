@@ -112,5 +112,5 @@ async def main():
             await mon.initialized.wait()
         create_windows(mcs)
 
-if __name__ is '__main__':
+if __name__ == '__main__':
     trio_gtk.run(main)

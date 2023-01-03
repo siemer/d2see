@@ -14,10 +14,16 @@ class TestPattern(Gtk.Bin):
     def __init__(self, *args, **kwargs):
         super().__init__()
 
+    # avoids error:
+    # Gtk-CRITICAL gtk_widget_get_preferred_width_for_height:
+    #  assertion 'height >= 0' failed
+    def do_get_preferred_height(self):
+        return 300, 500
+
     def do_size_allocate(self, allocation):
         self.set_allocation(allocation)
         width, height = allocation.width, allocation.height
-        print("do_size_allocate() FUNCTION, width:", width)
+        #print("do_size_allocate() FUNCTION, width:", width)
         smaller_dim = min(width, height)
         if smaller_dim > 800:
             self.square_size = 80
@@ -86,7 +92,7 @@ class TestPattern(Gtk.Bin):
     def do_draw(self, c):
         allocation = self.get_allocation()
         w, h = allocation.width, allocation.height
-        print('draw():', w, h)
+        # print('draw():', w, h)
         Gtk.render_background(self.get_style_context(), c, 0, 0, w, h)
 
         c.set_source_rgb(1, 1, 1)
@@ -99,7 +105,6 @@ class BrightnessScale(Gtk.Scale):
     def __init__(self, monitor_settings):
         super().__init__()
         self._monitor_settings = ms = monitor_settings
-        print(ms._monitor._ddcci.edid_id)
         self.set_digits(0)
         self.set_range(0, ms.settings[0x10].max)
         self.set_increments(-5, 5)
@@ -114,7 +119,7 @@ class PatternWindow(Gtk.Window):
         super().__init__(title='d2see test pattern')
         self.desktop_index = desktop_index
         self.connect('delete-event', Gtk.main_quit)
-        self.connect('realize', self.realized)
+        self.connect('map-event', self.mapped)
         main = TestPattern()
         box = Gtk.VBox()
         label = Gtk.Label(label='Hello!')
@@ -137,7 +142,7 @@ class PatternWindow(Gtk.Window):
         #     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.show_all()
 
-    def realized(self, self2):
+    def mapped(self, self2, event):
         # other move ops don’t work on i3 window manager
         self.get_window().move_to_desktop(self.desktop_index)
         self.fullscreen()
