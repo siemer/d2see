@@ -19,7 +19,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 '''
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from weakref import WeakSet
 import fcntl
 import functools
 import glob
@@ -547,6 +548,18 @@ class Setting:
   writing_cycles = 2  # how often we write to hw before checking
   max: int = None  # maximum allowed value according to monitor
   write_time: int = 0  # only req: later time is bigger number (monitor global)
+  listeners: set = field(default_factory=WeakSet)  # callbacks for changes in current_value
+
+  def add_listener(self, cb):
+    self.listeners.add(cb)
+    if self.current_value != None:
+      cb(self.current_value)
+
+  def _set_current_value(self, new_value):
+    if self.current_value != new_value:
+      self.current_value = new_value
+      for cb in self.listeners:
+        cb(new_value)
 
   def set(self, value, max):
     '''Set fields according to hardware read real values.
@@ -558,19 +571,23 @@ class Setting:
       self.max = max
     elif self.new_value != value:
       # writings did not succeed
-      self.writings_left = Setting.writing_cycles
-      print(f'Control read returned unexpected value {value}. Expected {self.new_value}.')
+      if self.new_value > max:  # ...and it probably never will succeed
+        self.new_value = value
+        print(f'Caught write with value beyond max {max}. Leaving it at current value {value}.')
+      else:
+        self.writings_left = Setting.writing_cycles
+        print(f'Control read returned unexpected value {value}. Expected {self.new_value}.')
     else:
       # writing worked fine
       assert self.max == max
       assert self.writings_left == 0
-    self.current_value = value
+    self._set_current_value(value)
     self.confirmed = True
 
   def ack_write(self, time):
     '''Update fields in case self.new_value is written to hardware.
     Part of the interface to hardware handling code.'''
-    self.current_value = self.new_value
+    self._set_current_value(self.new_value)
     self.confirmed = False
     self.write_time = time
     if self.writings_left >= 1:
@@ -589,12 +606,13 @@ class Setting:
       self.writings_left = Setting.writing_cycles
       return True
 
-  def read(self):
+  def read(self, max=False):
     '''Return best knowledge of the Setting. Raises exception if it
     wasn’t initialized.
     Part of the interface to users of Setting.'''
-    if self.current_value is not None:
-      return self.current_value
+    thing = self.max if max else self.current_value
+    if thing is not None:
+      return thing
     else:
       raise RuntimeError('Can’t guess Setting which was never properly initialized.')
 
@@ -620,11 +638,10 @@ class MonitorController:
         f'd2see/{edid_device.edid_id}')
     self._mccs = Mccs(file_name=edid_device.file_name, open_config = self.open_config)
     self.settings = dict()
-    for reg in 0x10,:
+    for reg in 0x10, 0x12:
       self.settings[reg] = Setting(reg)
     self.initialized = trio.Event()
-    self._waiting_for_task = trio.Event()
-    self._new_task_available = trio.Event()
+    self._task_available = trio.Event()
     self._time = 0  # increments on each write; good enough for ack_write()
 
   @staticmethod
@@ -653,20 +670,17 @@ class MonitorController:
       s = max(self.settings.values(), key=Setting.cmp_key)
       if s.done():
         self.initialized.set()  # effectively set when tasks from __init__() are .done()
-        self._waiting_for_task.set()
         await self._new_task_available.wait()
-        self._waiting_for_task = trio.Event()
       else:
         return s
 
-  def read(self, register):
-    return self.settings[register].read()
+  def read(self, register, **kwargs):
+    return self.settings[register].read(**kwargs)
 
   def write(self, register, value):
     if self.settings[register].write(value):
-      if self._waiting_for_task.is_set():
-        self._new_task_available.set()
-        self._new_task_available = trio.Event()
+      self._task_available.set()
+      self._task_available = trio.Event()
 
   async def handle_tasks(self):
     await self._mccs.optimize_delays()

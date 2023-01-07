@@ -100,19 +100,29 @@ class TestPattern(Gtk.Bin):
         self.draw_segments(c)
         self.propagate_draw(self.get_child(), c)
 
-
-class BrightnessScale(Gtk.Scale):
-    def __init__(self, monitor_settings):
+class MonitorSettings(Gtk.VBox):
+    def __init__(self, mc):
         super().__init__()
-        self._monitor_settings = ms = monitor_settings
-        self.set_digits(0)
-        self.set_range(0, ms.settings[0x10].max)
-        self.set_increments(-5, 5)
-        self.connect('value-changed', self.set_brightness)
+        for register in 0x10, 0x12:
+            self.add(MonitorScale(mc, register))
 
-    def set_brightness(self, _):
+class MonitorScale(Gtk.Scale):
+    def __init__(self, mc, register):
+        super().__init__()
+        self._monitor_controller = mc
+        self.register = register
+        self.set_digits(0)
+        self.set_range(0, mc.read(register, max=True))
+        self.set_increments(-5, 5)
+        self.connect('value-changed', self.gui_changed)
+        mc.settings[register].add_listener(self.hardware_changed)
+
+    def gui_changed(self, _):
         v = round(self.get_value())
-        self._monitor_settings.write(0x10, v)
+        self._monitor_controller.write(self.register, v)
+
+    def hardware_changed(self, value):
+        self.set_value(value)
 
 class PatternWindow(Gtk.Window):
     def __init__(self, monitor_controllers, desktop_index):
@@ -120,18 +130,18 @@ class PatternWindow(Gtk.Window):
         self.desktop_index = desktop_index
         self.connect('delete-event', Gtk.main_quit)
         self.connect('map-event', self.mapped)
-        main = TestPattern()
-        box = Gtk.VBox()
+        pattern = TestPattern()
+        vbox = Gtk.VBox()
         label = Gtk.Label(label='Hello!')
         button_box = Gtk.ButtonBox()
         button_close = Gtk.Button(label='Close')
         button_close.connect('clicked', Gtk.main_quit)
-        scale = BrightnessScale(monitor_controllers[0])
-        self.add(main)
-        main.add(box)
-        box.pack_start(label, True, True, 0)
-        box.add(button_box)
-        button_box.add(scale)
+        self.add(pattern)
+        pattern.add(vbox)
+        vbox.pack_start(label, True, True, 0)
+        vbox.add(button_box)
+        for mc in monitor_controllers:
+            button_box.add(MonitorSettings(mc))
         button_box.add(button_close)
         # style_provider = Gtk.CssProvider()
         # style_provider.load_from_data(b'''
