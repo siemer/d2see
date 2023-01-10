@@ -19,8 +19,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 '''
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from weakref import WeakSet
 import fcntl
 import functools
 import glob
@@ -101,17 +99,12 @@ from ddcci import xdg
 # - first byte has two functions
 #   - written as i2c addressing
 #   - but conceptually also the first byte of the (read!) ddc/ci message
-#   - 
 #   - is part of the checksum
-#   - BUT: 
-#   i2c addressing
-# - 
+#   - ...
 
 # writes start with:
 # 0x6e (i2c 0x37 addr + 0 for writing), then 0x51
-# - on communications from master to slave, the spec seems to think of
-#   using the 
-
+# - ...
 
 # If ddc/ci wants to keep that sender/destination non-sense, why not use
 # the entire message as i2c data?
@@ -119,13 +112,10 @@ from ddcci import xdg
 # is flipped to form the other address)? That looks like i2c’s first byte for
 # reading/writing.
 
-
 # Why not calculate the checksum with the first byte as-is or without it?
 
 # And why not be consistent with the use of the two addresses?
 
-
-# 
 # It starts with the fact that slave address 0x37 is written as 0x6e/0x6f.
 # That would be the addr-rw-byte on i2c: i.e. 0x37 left shifted by 1 either
 # with or without the rw bit (least significant bit) set.
@@ -134,8 +124,8 @@ from ddcci import xdg
 # Finally a ddc/ci message starts with the destination address followed by the
 # source address (and then more). Like a packet. Written by the sender.
 # But on the i2c wire, the first byte is always written by the master, with
-# the address of the slave (and the rw bit). 
-# written by the host, and always the addr of the 
+# the address of the slave (and the rw bit).
+
 # 1. It considers the i2c address/rw byte part of the ddc/ci message.
 # 2. It talks about slave address 0x6e/0x6f, which is i2c address 0x37 with
 #    rw bit set to write/read. (0x6e >> 1 == 0x37)
@@ -149,8 +139,6 @@ from ddcci import xdg
 #    what i2c should indeed be sending), but it is supposed to be 0x50 on
 #    reads. Supposedly written by the slave? That would be the host addr +
 #    write(!) mode. WTF
-
-# ddc/ci messages are 
 
 
 # length byte first bit: should be 0 on vendor specific msgs
@@ -189,13 +177,11 @@ from ddcci import xdg
 # 0x12 contrast
 # 0x14 select color preset
 
-
 # Controls
 #
 # C – Continuous (0-max)
 # NC – Non Continuous
 # T – Table
-
 
 examples = {name: bytearray.fromhex(string) for name, string in {
     'enable application report': '6e 51 82 f5 01 49',
@@ -211,7 +197,7 @@ examples = {name: bytearray.fromhex(string) for name, string in {
     'internal: touch screen to host': '6f f0 82 a1 00 83',
 }.items()}
 
-# dst addr, “src addr”, ((amount of following bytes)-1) & 0x80 if 
+# dst addr, “src addr”, ((amount of following bytes)-1) & 0x80 if
 #  MCCS std op code to follow, op code, ..., chksum
 
 # (length) from op code, without checksum (wait period afterwards):
@@ -297,9 +283,10 @@ class EdidDevice:
 class CrappyHardwareError(IOError):
   pass
 
-@dataclass
 class WouldBlockTime(Exception):
-  wait_time: int
+  def __init__(self, wait_time):
+    super().__init__()
+    self.wait_time = wait_time
 
 def async_version_of(method):
   async def async_method(*args, **kwargs):
@@ -320,13 +307,17 @@ class Ddcci:
     self.set_delay = self.waiter.set_delay
     self.safe_delay = self.waiter.safe_delay
 
-  def write_nowait(self, *args):
-    self.waiter.ensure_waited('w')
+  @staticmethod
+  def ddc2i2c(*args):
     ba = bytearray(args)
     ba.insert(0, len(ba) | 0x80)
     ba.insert(0, 0x51)
     ba.append(functools.reduce(operator.xor, ba, 0x6e))
-    res = self._dev.write(ba)
+    return ba
+
+  def write_nowait(self, *args):
+    self.waiter.ensure_waited('w')
+    res = self._dev.write(Ddcci.ddc2i2c(*args))
     self.waiter.set_last('w')
     return res
 
@@ -538,111 +529,251 @@ class Mccs:
     return await self.write(0x10, value)
 
 
-@dataclass
-class Setting:
-  register: int
-  current_value: int = None  # suspected or confirmed value in monitor
-  new_value: int = None  # value to be sent to monitor
-  confirmed: bool = False  # current_value is really in hardware
-  writings_left: int = 0  # write several times, before even checking
+class BaseSetting:
+  def __init__(self, controller, register):
+    self.controller = controller
+    self.register = register
+
+  def read_prepared(self):
+    return self.controller._mccs._read_vcpopcode == self.register
+
+  def max_interaction_index(self):
+    return len(self.controller._settings)
+
+  def interaction_index(self):
+    il = self.controller._interaction_log
+    if self.register in il:
+      return list(reversed(il)).index(self.register)
+    else:
+      return self.max_interaction_index()
+
+class Setting2:
+  # might change this into a w/o setting base...
+  def __init__(self):
+    self.register = 0x2
+    self.new_value = None
+    self.writings_left = 0
+
+  def ack_write(self, *args):
+    self.writings_left = 0
+
+  def select_operation(self):
+    assert self.writings_left
+    return 'write', (self.new_value,), self.ack_write
+
+  def _write(self, value):
+    self.new_value = value
+    self.writings_left = 1
+    return True
+
+  def priority(self):
+    if self.writings_left:
+      return (Setting.writing_cycles+1, )
+    else:
+      return (-1, )
+
+
+class Setting52(BaseSetting):
+  def __init__(self, controller):
+    super().__init__(controller, 0x52)
+    self.last_value = None  # set to None on reset52()
+    self.next_check = 0
+
+  def _reset52(self):
+    self.controller.write(0x2, 0x1)
+    self.last_value = None
+
+  def select_operation(self):
+    time_left = self.next_check - time.time()
+    if time_left <= 0:
+      return 'read', (), self.ack_read
+    else:
+      return 'wait', time_left, 0
+
+  def ack_read(self, result):
+    value, *args = result
+    if self.last_value not in (None, 0) and self.last_value != value:
+      self.controller.needs_reset52.no()
+    if value == 0:  # continue polling (no news)
+      self.next_check = time.time() + 1
+    else:
+      setting = self.controller.setting(value)
+      if setting:  # we work with this setting
+        if setting.writings_left == 0:  # ...and we don’t change sth ourselves rn
+          setting.reread(from52=True)  # trigger new read on different register
+      elif self.last_value == value and not self.controller.needs_reset52.locked():
+        # Trap awaits us if nothing drives needs_reset52 to determination. Happens here:
+        # - needs_reset52 is not settled and defaults to False
+        # - value is reread (and not 0)
+        # - we don’t have a Setting*() for this value (which eventually determines)
+        # either drive determination or reset52() to jump dead point
+        self._reset52()
+      if self.controller.needs_reset52.val():  # need to advance manually
+        self._reset52()
+    self.last_value = value
+
+  def priority(self):
+    # (self.writings_left, not self.confirmed, self.read_prepared(), self.interaction_index())
+    # less important than writing, less than unconfirmed reading, ...vcp...,
+    #  ...but more than other confirmed!
+    # so I’m like reading, confirmed, read_prepared(), self.max_interaction_index()+1
+    return (0, not True, self.read_prepared(), self.max_interaction_index()+1)
+
+class Setting(BaseSetting):
   writing_cycles = 2  # how often we write to hw before checking
-  max: int = None  # maximum allowed value according to monitor
-  write_time: int = 0  # only req: later time is bigger number (monitor global)
-  listeners: set = field(default_factory=WeakSet)  # callbacks for changes in current_value
 
-  def add_listener(self, cb):
-    self.listeners.add(cb)
-    if self.current_value != None:
-      cb(self.current_value)
+  def reread(self, *, from52=False):
+    '''Clear any write attempts and trigger read from hardware.
+    Do remember old value for future reference, though.'''
+    self.before_52_fresh = getattr(self, 'current_value', None) if from52 else None
+    self.current_value = None  # suspected or confirmed value in monitor
+    self.new_value = None  # value to be sent to monitor
+    self.confirmed = False  # current_value is really in hardware
+    self.writings_left = 0  # write several times, before even checking
 
-  def _set_current_value(self, new_value):
+  def __init__(self, controller, register):
+    super().__init__(controller, register)
+    self.reread()
+    self.max = None  # maximum allowed value according to monitor
+    self.listeners = set()  # callbacks for changes in current_value
+    self.max_listeners = set()  # callbacks for max (called at most once)
+
+  def add_listeners(self, callback, max_callback=None):
+    for (cb, value, listeners, one_time) in (
+      (callback, self.current_value, self.listeners, False),
+      (max_callback, self.max, self.max_listeners, True),
+        ):
+      if cb is not None:
+        if value is not None:
+          cb(value)
+        if not one_time or value is None:
+          listeners.add(cb)
+
+  def _set_current_value(self, new_value, /):
+    # actually always called after hw read and hw write
+    self.before_52_fresh = None
     if self.current_value != new_value:
       self.current_value = new_value
       for cb in self.listeners:
         cb(new_value)
 
-  def set(self, value, max):
+  def _set_max(self, max):
+    if self.max is None:
+      self.max = max
+      while self.max_listeners:
+        self.max_listeners.pop()(max)
+    elif self.max != max:
+      print(f'Max value on {self.register:#x} changed from {self.max} to {max}. Ignoring.')
+    assert not self.max_listeners
+
+  def ack_read(self, result):
     '''Set fields according to hardware read real values.
     Part of the interface to hardware handling code.
     Is either used on first initial hardware read for this setting or
     for the confirmation hardware read after several writes.'''
-    if self.current_value is None:
-      # initial hw read
-      self.max = max
-    elif self.new_value != value:
-      # writings did not succeed
+    value, max, *args = result
+    if self.new_value is not None and self.new_value != value:  # writings did not succeed
       if self.new_value > max:  # ...and it probably never will succeed
         self.new_value = value
         print(f'Caught write with value beyond max {max}. Leaving it at current value {value}.')
       else:
         self.writings_left = Setting.writing_cycles
-        print(f'Control read returned unexpected value {value}. Expected {self.new_value}.')
-    else:
-      # writing worked fine
-      assert self.max == max
+        print(f'Control read on {self.register:#x} was {value} instead of {self.new_value}.')
+    else:  # writing worked fine (or not coming from writing: reread, initial read)
       assert self.writings_left == 0
+    if self.before_52_fresh == value:  # pre-reset value read
+      # needs reset or it was manually set to same value
+      self.controller.needs_reset52.yes()
+      self.current_value = self.before_52_fresh
+    self._set_max(max)
     self._set_current_value(value)
     self.confirmed = True
 
-  def ack_write(self, time):
+  def ack_write(self, *args):
     '''Update fields in case self.new_value is written to hardware.
     Part of the interface to hardware handling code.'''
     self._set_current_value(self.new_value)
     self.confirmed = False
-    self.write_time = time
-    if self.writings_left >= 1:
-      self.writings_left -= 1
-    else:
-      self.writings_left = 0
+    self.writings_left = max(self.writings_left-1, 0)
 
-  def write(self, value):
+  def select_operation(self):
+    if self.writings_left == 0:
+      return 'read', (), self.ack_read
+    else:
+      return 'write', (self.new_value,), self.ack_write
+
+  def _write(self, value):
     '''Set write wish in fields.
-    Part of the interface to users of Setting.'''
-    if self.new_value == value:
-      # same write is already underway
+    Part of the interface to users of Setting.
+    Returns boolean reflecting possible change in priorities (True).'''
+    if self.new_value == value:  # same write is already underway
       return False
+    elif self.current_value == value:  # returning to value in monitor
+      self.writings_left = 0
     else:
-      self.new_value = value
       self.writings_left = Setting.writing_cycles
-      return True
+    self.new_value = value
+    return True
 
-  def read(self, max=False):
-    '''Return best knowledge of the Setting. Raises exception if it
-    wasn’t initialized.
-    Part of the interface to users of Setting.'''
-    thing = self.max if max else self.current_value
-    if thing is not None:
-      return thing
-    else:
-      raise RuntimeError('Can’t guess Setting which was never properly initialized.')
+  def priority(self):
+    # 1. prefer writing
+    # 1.1. prefer “first” write instead of rewrites
+    # 2. reading
+    # 2.1. prefer reading values to be confirmed, not already confirmed
+    # 2.2. prefer reading which was prepared already (IMPORTANT; avoids back-and-forth w/ 2 tasks)
+    # 3. prefer least recently interacted register (might endless ping-pong reads without 2.2.)
+    return (self.writings_left, not self.confirmed, self.read_prepared(),
+      self.interaction_index())
 
-  def done(self):
-    return self.confirmed and self.writings_left == 0
+class SettingsDict(dict):
+  def __init__(self, controller):
+    super().__init__()
+    self._controller = controller
+  def __missing__(self, key):
+    self[key] = Setting(self._controller, key)
+    return self[key]
 
-  @staticmethod
-  def cmp_key(i):
-    if i.current_value is None:
-      # initial hardware reads get highest priority
-      return (Setting.writing_cycles + 1,)
-    elif i.writings_left == 0:
-      # some control reads left
-      return (0, -i.confirmed, -i.write_time)
-    else:
-      # write task
-      return (i.writings_left, -i.write_time)
+class Needs_reset52:
+  '''Starts as a fluent False. Will reach definitive state with yes()/no(). While fluent, a no()
+  locks it to False, and [max] yes() will lock it to True.'''
+  def __init__(self, max, /):
+    self._x = 0
+    self._max = max
+
+  def locked(self):
+    return True if self._x in (-1, self._max) else False
+
+  def no(self):
+    if not self.locked():
+      print('monitor needs_reset52: no')
+      self._x = -1
+
+  def yes(self):
+    if not self.locked():
+      if self._x == self._max - 1: print('monitor needs_reset52: yes')
+      self._x = min(self._max, self._x+1)
+
+  def val(self):
+    return False if self._x < self._max else True
 
 class MonitorController:
-  def __init__(self, edid_device):
+  def __init__(self, edid_device, nursery):
     self.edid_device = edid_device
     self.open_config = functools.partial(xdg.open_config,
         f'd2see/{edid_device.edid_id}')
     self._mccs = Mccs(file_name=edid_device.file_name, open_config = self.open_config)
-    self.settings = dict()
-    for reg in 0x10, 0x12:
-      self.settings[reg] = Setting(reg)
-    self.initialized = trio.Event()
-    self._task_available = trio.Event()
-    self._time = 0  # increments on each write; good enough for ack_write()
+    self.operations = dict(read=self._mccs.read_nowait, write=self._mccs.write_nowait)
+    self._settings = SettingsDict(self)
+    self._settings[0x52] = Setting52(self)
+    self._settings[0x2] = Setting2()
+    self._prio_changed = trio.Event()  # or possibly changed
+    self._interaction_log = {}
+    self.needs_reset52 = Needs_reset52(4)
+    nursery.start_soon(self._handle_tasks)
+
+  def _interacted(self, setting):
+    self._interaction_log.pop(setting.register, None)
+    self._interaction_log[setting.register] = setting
 
   @staticmethod
   def coldplug(nursery):
@@ -654,9 +785,7 @@ class MonitorController:
       except IOError:
         continue
       else:
-        mc = MonitorController(edid_device=edid_device)
-        nursery.start_soon(mc.handle_tasks)
-        mcs.append(mc)
+        mcs.append(MonitorController(edid_device=edid_device, nursery=nursery))
         if edid_device.edid256 in edid_datas:
           print('Monitors with the same EDID found. ' \
                 'This will probably mess things up.')
@@ -664,45 +793,45 @@ class MonitorController:
           edid_datas.add(edid_device.edid256)
     return mcs
 
-  async def _next_task(self):
-    # if a setting is not .done() it dual functions as a task as well
-    while True:
-      s = max(self.settings.values(), key=Setting.cmp_key)
-      if s.done():
-        self.initialized.set()  # effectively set when tasks from __init__() are .done()
-        await self._new_task_available.wait()
-      else:
-        return s
+  async def _next_task(self, sleep):
+    # a setting dual functions as a task as well
+    '''Return highest priority task. There is always one: the idle task for polling settings.
+    Do minimum_sleep unconditionally first, bc it may be interrupted which requires checking
+    for new highest prio task.'''
+    with trio.move_on_after(sleep):
+      await self._prio_changed.wait()
+    return max(self._settings.values(), key=lambda item: item.priority())
 
-  def read(self, register, **kwargs):
-    return self.settings[register].read(**kwargs)
+  def setting(self, reg):
+    return self._settings.get(reg, None)
+
+  def add_listeners(self, register, *args, **kwargs):
+    return self._settings[register].add_listeners(*args, **kwargs)
 
   def write(self, register, value):
-    if self.settings[register].write(value):
-      self._task_available.set()
-      self._task_available = trio.Event()
+    if self._settings[register]._write(value):
+      self._prio_changed.set()
+      self._prio_changed = trio.Event()
 
-  async def handle_tasks(self):
+  async def _handle_tasks(self):
     await self._mccs.optimize_delays()
+    sleep = 0
     while True:
-      task = await self._next_task()
-      if task.writings_left > 0:
-        try:
-          self._mccs.write_nowait(task.register, task.new_value)
-        except WouldBlockTime as e:
-          await trio.sleep(e.wait_time)
-        else:
-          self._time += 1
-          task.ack_write(self._time)
+      task = await self._next_task(sleep)
+      sleep = 0
+      operation, op_args, ack_func = task.select_operation()
+      if operation == 'wait':
+        sleep = op_args
+        continue
+      try:
+        result = self.operations[operation](task.register, *op_args)
+      except WouldBlockTime as e:
+        sleep = e.wait_time
+      except IOError:
+        print(f'IOError on {operation} in handle_tasks(). Keeping operation in schedule.')
       else:
-        try:
-          c, m, _ = self._mccs.read_nowait(task.register, compensate=True)
-        except WouldBlockTime as e:
-          await trio.sleep(e.wait_time)
-        except IOError:
-          print('Control read unsuccessful.')
-        else:
-          task.set(c, m)
+        ack_func(result)
+        self._interacted(task)
 
 
 class TimingTest:

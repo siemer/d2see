@@ -108,8 +108,6 @@ def create_windows(monitor_controllers):
 async def main():
     async with trio.open_nursery() as nursery:
         mcs = ddcci.MonitorController.coldplug(nursery)
-        for mon in mcs:
-            await mon.initialized.wait()
         create_windows(mcs)
 
 if __name__ == '__main__':

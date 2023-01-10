@@ -1,0 +1,29 @@
+Polling settings from monitor
+
+* MCCS standard has mechanisms to improve synchronization
+* polling of one register should be enough – but some monitors don’t support that
+* level of support seen:
+  a) no support; each value must be polled directly
+  b)  change detection; reveals change (reg. 0x02, needs reset), but not which
+  c) last event; reveals last changed register (reset possible), but no way to detect overflow
+  d) events can be read, but non-standard: reset to see next event
+  [e) event FIFO can be polled (never seen)]
+* reset is to write 0x01 to 0x02
+* changed register might be reported on read of 0x52
+  * read supposed to consume event; but never seen that...
+  * reset revels next event or 0x00 (no event)
+* 0x02 reads 0x02 if event occurred
+* trivia: DisplayPort can/must raise HPD (Hot Plug Detect) line as interrupt
+
+
+Solutions
+
+* poll register 0x52 for c), d) and e)
+  * if not 0x00
+    * poll found register
+    * reset for c) and d) – counterproductive for e)
+
+* how to poll
+  * handler needs to be interrupted by time during wait
+    * maybe I can even use this to interrupt it on setting-writes as well
+  * validated/done status needs to vanish with time

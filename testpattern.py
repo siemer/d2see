@@ -112,10 +112,9 @@ class MonitorScale(Gtk.Scale):
         self._monitor_controller = mc
         self.register = register
         self.set_digits(0)
-        self.set_range(0, mc.read(register, max=True))
         self.set_increments(-5, 5)
         self.connect('value-changed', self.gui_changed)
-        mc.settings[register].add_listener(self.hardware_changed)
+        mc.add_listeners(register, self.hardware_changed, self.max)
 
     def gui_changed(self, _):
         v = round(self.get_value())
@@ -123,6 +122,10 @@ class MonitorScale(Gtk.Scale):
 
     def hardware_changed(self, value):
         self.set_value(value)
+
+    def max(self, max):
+        self.set_range(0, max)
+
 
 class PatternWindow(Gtk.Window):
     def __init__(self, monitor_controllers, desktop_index):
