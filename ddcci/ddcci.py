@@ -19,6 +19,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 '''
 
 from contextlib import contextmanager
+import enum
 import fcntl
 import functools
 import glob
@@ -27,6 +28,7 @@ import operator
 import os
 import random
 import time
+import traceback
 
 import trio
 from ddcci import xdg
@@ -251,9 +253,9 @@ class I2cDev:
     if length < 20: printbytes('read: {}', ba)
     return ba
 
-  def write(self, *args, **kwargs):
-    printbytes('write: {}', args[0])
-    return os.write(self._dev, *args, **kwargs)
+  def write(self, buffer):
+    printbytes('write: {}', buffer)
+    return os.write(self._dev, buffer)
 
 class EdidDevice:
   def __init__(self, file_name):
@@ -303,22 +305,21 @@ def async_version_of(method):
 class Ddcci:
   def __init__(self, *, file_name, open_config):
     self.waiter = Waiter(open_config)
-    self._dev = I2cDev(i2c_slave_addr=0x37, file_name=file_name)
+    self._i2c = I2cDev(i2c_slave_addr=0x37, file_name=file_name)
     self.set_delay = self.waiter.set_delay
     self.safe_delay = self.waiter.safe_delay
 
   @staticmethod
-  def ddc2i2c(*args):
-    ba = bytearray(args)
+  def ddc2i2c(buffer):
+    ba = bytearray(buffer)
     ba.insert(0, len(ba) | 0x80)
     ba.insert(0, 0x51)
     ba.append(functools.reduce(operator.xor, ba, 0x6e))
     return ba
 
-  def write_nowait(self, *args):
-    self.waiter.ensure_waited('w')
-    res = self._dev.write(Ddcci.ddc2i2c(*args))
-    self.waiter.set_last('w')
+  def write_nowait(self, buffer):
+    self.waiter.prepare('w')
+    res = self._i2c.write(Ddcci.ddc2i2c(buffer))
     return res
 
   write = async_version_of(write_nowait)
@@ -334,17 +335,16 @@ class Ddcci:
     if False in checks.values():
       raise IOError(checks)
 
-  def read_nowait(self, amount, *, compensate=False):
-    self.waiter.ensure_waited('r')
+  def read_nowait(self, amount, /, *, compensate=False):
+    self.waiter.prepare('r')
     length = amount + 3
-    b = self._dev.read(length)
-    self.waiter.set_last('r')
+    b = self._i2c.read(length)
     leading_zeros = len(list(itertools.takewhile(lambda x: x == 0, b)))
     if leading_zeros == length:
       raise CrappyHardwareError()
     elif leading_zeros and compensate:
       print(f'Compensating {leading_zeros} zeros.')
-      b2 = self._dev.read(leading_zeros + 5)
+      b2 = self._i2c.read(leading_zeros + 5)
       b = b[leading_zeros:] + b2[:leading_zeros]
     Ddcci.check_read_bytes(b)
     b = b[2:-1]
@@ -404,7 +404,10 @@ class Waiter:
     self.delays['rw'] = max(*raw.values())
     print(self.delays)
 
-  def ensure_waited(self, which):
+  def prepare(self, which):
+    '''Either raise WouldBlockTime with corresponding timeout or update this Waiter
+    to reflect execution of the corresponding operation. I.e. the prepared op should
+    be called immediately.'''
     assert which in ('r', 'w')
     succession = self.last_which + which
     wait_time = self.last_when + self.delays[succession] - time.time()
@@ -412,8 +415,6 @@ class Waiter:
     wait_time = max(0, wait_time)
     if wait_time:
       raise WouldBlockTime(wait_time)
-
-  def set_last(self, which):
     self.last_when = time.time()
     self.last_which = which
 
@@ -460,6 +461,12 @@ def try_again(afunc):
 
 
 class Mccs:
+  class Op(enum.Enum):
+    READ = (1, 1)
+    READ_REPLY = 2
+    WRITE = (3, 1, 2)
+    CAPABILITIES = (0xf3, 2)
+
   def __init__(self, *, file_name, open_config):
     self._ddcci = Ddcci(file_name=file_name, open_config=open_config)
     self._read_vcpopcode = None
@@ -473,20 +480,30 @@ class Mccs:
     else:
       await trio.sleep(0)
 
+  @staticmethod
+  def mccs2ddc(op, /, *args):
+    assert type(op) is Mccs.Op
+    assert type(op.value) is tuple
+    assert len(op.value) == len(args) + 1
+    res = [op.value[0]]
+    for arg, length in zip(args, op.value[1:]):
+      res.extend(arg.to_bytes(length, 'big'))
+    return res
+
   @invalidate_read_preparation
   def write_nowait(self, vcpopcode, value):
-    return self._ddcci.write_nowait(0x03, vcpopcode, *value.to_bytes(2, 'big'))
+    return self._ddcci.write_nowait(Mccs.mccs2ddc(Mccs.Op.WRITE, vcpopcode, value))
 
   write = async_version_of(write_nowait)
 
   @invalidate_read_preparation
   def read_nowait(self, vcpopcode, *, compensate=False):
     if self._read_vcpopcode != vcpopcode:
-      self._ddcci.write_nowait(0x01, vcpopcode)
+      self._ddcci.write_nowait(Mccs.mccs2ddc(Mccs.Op.READ, vcpopcode))
       self._read_vcpopcode = vcpopcode
     b = self._ddcci.read_nowait(8, compensate=compensate)
     checks = {
-      'is feature reply': b[0] == 0x02,
+      'is feature reply': b[0] == Mccs.Op.READ_REPLY.value,
       'supported VCP opcode': b[1] == 0,
       'answer matches request': b[2] == vcpopcode,
         }
@@ -499,16 +516,16 @@ class Mccs:
 
   @invalidate_read_preparation
   def flush_nowait(self):
-    return self._ddcci.write(0x0c)
+    return self._ddcci.write([0x0c])
 
   @invalidate_read_preparation
   def capabilities_nowait(self):
-    self._ddcci.write(0xf3, 0, 0)
+    self._ddcci.write(Mccs.mccs2ddc(Mccs.Op.CAPABILITIES, 0))
     # ...
 
   @invalidate_read_preparation
   def timing_nowait(self):
-    self._ddcci.write(0x07)
+    self._ddcci.write([0x07])
     return self._ddcci.read(6)
 
   @try_again
@@ -548,9 +565,9 @@ class BaseSetting:
       return self.max_interaction_index()
 
 class Setting2:
+  register = 0x2
   # might change this into a w/o setting base...
   def __init__(self):
-    self.register = 0x2
     self.new_value = None
     self.writings_left = 0
 
@@ -580,7 +597,7 @@ class Setting52(BaseSetting):
     self.next_check = 0
 
   def _reset52(self):
-    self.controller.write(0x2, 0x1)
+    self.controller.write(Setting2.register, 0x1)
     self.last_value = None
 
   def select_operation(self):
@@ -601,13 +618,15 @@ class Setting52(BaseSetting):
       if setting:  # we work with this setting
         if setting.writings_left == 0:  # ...and we don’t change sth ourselves rn
           setting.reread(from52=True)  # trigger new read on different register
-      elif self.last_value == value and not self.controller.needs_reset52.locked():
-        # Trap awaits us if nothing drives needs_reset52 to determination. Happens here:
-        # - needs_reset52 is not settled and defaults to False
-        # - value is reread (and not 0)
-        # - we don’t have a Setting*() for this value (which eventually determines)
-        # either drive determination or reset52() to jump dead point
-        self._reset52()
+      else:
+        print(f'Setting52: Setting {value:#x} is not handled by me yet.')
+        if self.last_value == value and not self.controller.needs_reset52.locked():
+          # Avoid getting stuck! Problem:
+          # - needs_reset52 is not settled and defaults to False
+          # - value is repeating (and not 0)
+          # - we don’t have a Setting*() for this value (which drives determination)
+          # → either drive determination or reset52() to jump dead point
+          self._reset52()
       if self.controller.needs_reset52.val():  # need to advance manually
         self._reset52()
     self.last_value = value
@@ -765,7 +784,7 @@ class MonitorController:
     self.operations = dict(read=self._mccs.read_nowait, write=self._mccs.write_nowait)
     self._settings = SettingsDict(self)
     self._settings[0x52] = Setting52(self)
-    self._settings[0x2] = Setting2()
+    self._settings[Setting2.register] = Setting2()
     self._prio_changed = trio.Event()  # or possibly changed
     self._interaction_log = {}
     self.needs_reset52 = Needs_reset52(4)
@@ -828,6 +847,7 @@ class MonitorController:
       except WouldBlockTime as e:
         sleep = e.wait_time
       except IOError:
+        # traceback.print_exc()
         print(f'IOError on {operation} in handle_tasks(). Keeping operation in schedule.')
       else:
         ack_func(result)
