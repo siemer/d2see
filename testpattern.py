@@ -103,28 +103,29 @@ class TestPattern(Gtk.Bin):
 class MonitorSettings(Gtk.VBox):
     def __init__(self, mc):
         super().__init__()
-        for register in 0x10, 0x12:
-            self.add(MonitorScale(mc, register))
+        for register, label in (
+                (0x10, 'Brightness'),
+                (0x12, 'Contrast'),
+            ):
+            self.pack_start(MonitorScale(mc, register, label), False, False, 0)
 
-class MonitorScale(Gtk.Scale):
-    def __init__(self, mc, register):
+class MonitorScale(Gtk.HBox):
+    def __init__(self, mc, register, text):
         super().__init__()
-        self._monitor_controller = mc
-        self.register = register
-        self.set_digits(0)
-        self.set_increments(-5, 5)
-        self.connect('value-changed', self.gui_changed)
-        mc.add_listeners(register, self.hardware_changed, self.max)
-
-    def gui_changed(self, _):
-        v = round(self.get_value())
-        self._monitor_controller.write(self.register, v)
-
-    def hardware_changed(self, value):
-        self.set_value(value)
-
-    def max(self, max):
-        self.set_range(0, max)
+        label = Gtk.Label(label=text)
+        scale = Gtk.Scale()
+        scale.set_size_request(100, -1)
+        scale.set_digits(0)
+        scale.set_increments(-5, 5)
+        scale.connect('value-changed',
+                lambda scale: mc.write(register, round(scale.get_value()))
+            )
+        mc.add_listeners(register,
+                lambda val: scale.set_value(val),
+                lambda max: scale.set_range(0, max),
+            )
+        self.pack_start(scale, False, False, 0)
+        self.pack_start(label, False, False, 0)
 
 
 class PatternWindow(Gtk.Window):
@@ -133,19 +134,21 @@ class PatternWindow(Gtk.Window):
         self.desktop_index = desktop_index
         self.connect('delete-event', Gtk.main_quit)
         self.connect('map-event', self.mapped)
-        pattern = TestPattern()
-        vbox = Gtk.VBox()
-        label = Gtk.Label(label='Hello!')
-        button_box = Gtk.ButtonBox()
+        label_hello = Gtk.Label(label='Hello!')
         button_close = Gtk.Button(label='Close')
         button_close.connect('clicked', Gtk.main_quit)
-        self.add(pattern)
-        pattern.add(vbox)
-        vbox.pack_start(label, True, True, 0)
-        vbox.add(button_box)
+        button_box = Gtk.HButtonBox()
+        button_box.pack_start(button_close, False, False, 0)
+        hbox_bottom = Gtk.HBox()
         for mc in monitor_controllers:
-            button_box.add(MonitorSettings(mc))
-        button_box.add(button_close)
+            hbox_bottom.pack_start(MonitorSettings(mc), False, False, 0)
+        hbox_bottom.pack_start(button_box, False, False, 0)
+        vbox_main = Gtk.VBox()
+        vbox_main.pack_start(label_hello, False, False, 0)
+        vbox_main.pack_start(hbox_bottom, False, False, 0)
+        pattern = TestPattern()
+        pattern.add(vbox_main)
+        self.add(pattern)
         # style_provider = Gtk.CssProvider()
         # style_provider.load_from_data(b'''
         #     * { color: #ff0077;
