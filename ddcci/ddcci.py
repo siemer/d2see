@@ -290,17 +290,34 @@ class WouldBlockTime(Exception):
     super().__init__()
     self.wait_time = wait_time
 
-def async_version_of(method):
-  async def async_method(*args, **kwargs):
+
+def variant(method, /, *, asynch=False, sync=False):
+  '''Returns (a)sync variant of the passed non-blocking function.
+  The non-blocking function is supposed to either return the final value or raise
+  WouldBlockTime() with a suggested time to wait.'''
+  assert asynch ^ sync
+  async def hybrid_method(*args, **kwargs):
     while True:
       try:
         res = method(*args, **kwargs)
       except WouldBlockTime as e:
-        await trio.sleep(e.wait_time)
+        if sync:
+          time.sleep(e.wait_time)
+        else:
+          await trio.sleep(e.wait_time)
         continue
       else:
         return res
-  return async_method
+  if asynch:
+    return hybrid_method
+  else:  # remove the async behaviour of the hybrid method
+    def async2sync(*args, **kwargs):
+      try:
+        hybrid_method(*args, **kwargs).send(None)
+      except StopIteration as e:
+        return e.value
+    return async2sync
+
 
 class Ddcci:
   def __init__(self, *, file_name, open_config):
@@ -322,35 +339,60 @@ class Ddcci:
     res = self._i2c.write(Ddcci.ddc2i2c(buffer))
     return res
 
-  write = async_version_of(write_nowait)
+  write = variant(write_nowait, asynch=True)
 
   @staticmethod
-  def check_read_bytes(ba):
-    chk_calc = functools.reduce(operator.xor, ba)
-    checks = {
-      'source address': ba[0] == 0x6e,
-      f'checksum {chk_calc}': chk_calc == 0x50,
-      'length': len(ba) >= (ba[1] & ~0x80) + 3
-        }
-    if False in checks.values():
-      raise IOError(checks)
+  def check_read_bytes(ba, op_code_hint):
+    '''Search for a DDC/CI reply in `ba`.
+    Raise IOError() if not even the beginning of any matching message was found.
+    Return minimum number of bytes missing to complete message (→ read more).
+    '''
+    while True:
+      index = ba.find(0x6e)  # “source address”; begin of every reply/reaction
+      if index == -1:
+        ba.clear()
+        raise IOError('Could not find reasonable start byte in chunk read.')
+      else:
+        del ba[0:index]
+      if len(ba) == 1:  # can not even read msg length
+        #return 2  # null message possible
+        return 10  # ...but msg length of 8 more likely and reading more does not hurt
+      else:
+        msg_l = ba[1] & ~0x80
+        missing_bytes = msg_l + 3 - len(ba)  # msg_l is without source addr, msg_l and checksum
+        if len(ba) == 2:  # can not even check reply_hint
+          if missing_bytes > 36:  # longest official msg_l is 35 → msg probably broken
+            return 9
+          else:
+            return missing_bytes
+        elif ba[2] != op_code_hint.value:  # not our msg; (probably not a msg at all)
+          del ba[0]
+          continue
+        elif missing_bytes > 0:
+          return missing_bytes
+        elif functools.reduce(operator.xor, ba[:msg_l+3]) != 0x50:  # checksum wrong
+          del ba[0]
+          continue
+        else: # jackpot
+          return ba[1:-1]
 
-  def read_nowait(self, amount, /, *, compensate=False):
+  def read_nowait(self, amount, /, *, op_code_hint):
     self.waiter.prepare('r')
     length = amount + 3
-    b = self._i2c.read(length)
-    leading_zeros = len(list(itertools.takewhile(lambda x: x == 0, b)))
-    if leading_zeros == length:
-      raise CrappyHardwareError()
-    elif leading_zeros and compensate:
-      print(f'Compensating {leading_zeros} zeros.')
-      b2 = self._i2c.read(leading_zeros + 5)
-      b = b[leading_zeros:] + b2[:leading_zeros]
-    Ddcci.check_read_bytes(b)
-    b = b[2:-1]
-    return b
+    ba = bytearray()
+    amount_read = 0
+    while amount_read < 1:
+      value = self._i2c.read(length)
+      amount_read += len(value)
+      ba.extend(value)
+      res = Ddcci.check_read_bytes(ba, op_code_hint)
+      if isinstance(res, int):
+        length = res
+      else:
+        return res
+    raise IOError('Continuous(?) reading did not reveal reply.')
 
-  read = async_version_of(read_nowait)
+  read = variant(read_nowait, asynch=True)
 
 class Waiter:
   def __init__(self, open_config):
@@ -429,11 +471,11 @@ def invalidate_read_preparation(method):
       raise
     except:
       # could be anything → invalidate
-      self._read_vcpopcode = None
+      self._read_preparation = Mccs._read_preparation_none
       raise
     else:
       # successful read/write → invalidate
-      self._read_vcpopcode = None
+      self._read_preparation = Mccs._read_preparation_none
       return res
   return new_method
 
@@ -461,15 +503,19 @@ def try_again(afunc):
 
 
 class Mccs:
+  _read_preparation_none = (None, None)
   class Op(enum.Enum):
     READ = (1, 1)
     READ_REPLY = 2
     WRITE = (3, 1, 2)
     CAPABILITIES = (0xf3, 2)
+    CAPABILITIES_REPLY = 0xe3
 
   def __init__(self, *, file_name, open_config):
     self._ddcci = Ddcci(file_name=file_name, open_config=open_config)
-    self._read_vcpopcode = None
+    self._read_preparation = Mccs._read_preparation_none
+    self._capabilities = bytearray()  # half-read capas
+    self.capabilities = None  # final capas (if read)
     self.safe_delay = self._ddcci.safe_delay
     self.set_delay = self._ddcci.set_delay
 
@@ -494,16 +540,16 @@ class Mccs:
   def write_nowait(self, vcpopcode, value):
     return self._ddcci.write_nowait(Mccs.mccs2ddc(Mccs.Op.WRITE, vcpopcode, value))
 
-  write = async_version_of(write_nowait)
+  write = variant(write_nowait, asynch=True)
 
   @invalidate_read_preparation
-  def read_nowait(self, vcpopcode, *, compensate=False):
-    if self._read_vcpopcode != vcpopcode:
-      self._ddcci.write_nowait(Mccs.mccs2ddc(Mccs.Op.READ, vcpopcode))
-      self._read_vcpopcode = vcpopcode
-    b = self._ddcci.read_nowait(8, compensate=compensate)
+  def read_nowait(self, vcpopcode):
+    read_this = (Mccs.Op.READ, vcpopcode)
+    if self._read_preparation != read_this:
+      self._ddcci.write_nowait(Mccs.mccs2ddc(*read_this))
+      self._read_preparation = read_this
+    b = self._ddcci.read_nowait(8, Mccs.Op.READ_REPLY)
     checks = {
-      'is feature reply': b[0] == Mccs.Op.READ_REPLY.value,
       'supported VCP opcode': b[1] == 0,
       'answer matches request': b[2] == vcpopcode,
         }
@@ -512,16 +558,24 @@ class Mccs:
     # present value, max value, VCP type code (0 == Set parameter, 1 = Momentary)?!?
     return int.from_bytes(b[6:8], 'big'), int.from_bytes(b[4:6], 'big'), b[3]
 
-  read = async_version_of(read_nowait)
+  read = variant(read_nowait, asynch=True)
 
   @invalidate_read_preparation
   def flush_nowait(self):
     return self._ddcci.write([0x0c])
 
   @invalidate_read_preparation
-  def capabilities_nowait(self):
-    self._ddcci.write(Mccs.mccs2ddc(Mccs.Op.CAPABILITIES, 0))
-    # ...
+  def read_capabilities_nowait(self):
+    if self.capabilities:
+      return self.capabilities
+    read_this = (Mccs.Op.CAPABILITIES, len(self._capabilities))
+    if self._read_preparation[0] != read_this[0]:
+      self._ddcci.write_nowait(Mccs.mccs2ddc(*read_this))
+      self._read_preparation = read_this
+    b = self._ddcci.read_nowait(35, Mccs.Op.CAPABILITIES_REPLY)  # max allowed fragment size 32; +3 capa header
+    checks = {
+      'is capabilities reply': b[0] == 
+    }
 
   @invalidate_read_preparation
   def timing_nowait(self):
@@ -551,8 +605,8 @@ class BaseSetting:
     self.controller = controller
     self.register = register
 
-  def read_prepared(self):
-    return self.controller._mccs._read_vcpopcode == self.register
+  def is_read_prepared(self):
+    return self.controller._mccs._read_preparation == (Mccs.Op.READ, self.register)
 
   def max_interaction_index(self):
     return len(self.controller._settings)
@@ -632,11 +686,11 @@ class Setting52(BaseSetting):
     self.last_value = value
 
   def priority(self):
-    # (self.writings_left, not self.confirmed, self.read_prepared(), self.interaction_index())
+    # (self.writings_left, not self.confirmed, self.is_read_prepared(), self.interaction_index())
     # less important than writing, less than unconfirmed reading, ...vcp...,
     #  ...but more than other confirmed!
-    # so I’m like reading, confirmed, read_prepared(), self.max_interaction_index()+1
-    return (0, not True, self.read_prepared(), self.max_interaction_index()+1)
+    # so I’m like reading, confirmed, is_read_prepared(), self.max_interaction_index()+1
+    return (0, not True, self.is_read_prepared(), self.max_interaction_index()+1)
 
 class Setting(BaseSetting):
   writing_cycles = 2  # how often we write to hw before checking
@@ -741,7 +795,7 @@ class Setting(BaseSetting):
     # 2.1. prefer reading values to be confirmed, not already confirmed
     # 2.2. prefer reading which was prepared already (IMPORTANT; avoids back-and-forth w/ 2 tasks)
     # 3. prefer least recently interacted register (might endless ping-pong reads without 2.2.)
-    return (self.writings_left, not self.confirmed, self.read_prepared(),
+    return (self.writings_left, not self.confirmed, self.is_read_prepared(),
       self.interaction_index())
 
 class SettingsDict(dict):
