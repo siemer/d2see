@@ -342,50 +342,53 @@ class Ddcci:
   write = variant(write_nowait, asynch=True)
 
   @staticmethod
-  def check_read_bytes(ba, op_code_hint):
+  def check_read_bytes(ba, op_code, len_min, len_max):
     '''Search for a DDC/CI reply in `ba`.
-    Raise IOError() if not even the beginning of any matching message was found.
-    Return minimum number of bytes missing to complete message (→ read more).
+    Return minimum number of bytes missing to complete message (→ read more)
+    or the bytearray with the message.
     '''
     while True:
       index = ba.find(0x6e)  # “source address”; begin of every reply/reaction
       if index == -1:
         ba.clear()
-        raise IOError('Could not find reasonable start byte in chunk read.')
       else:
         del ba[0:index]
-      if len(ba) == 1:  # can not even read msg length
-        #return 2  # null message possible
-        return 10  # ...but msg length of 8 more likely and reading more does not hurt
-      else:
-        msg_l = ba[1] & ~0x80
-        missing_bytes = msg_l + 3 - len(ba)  # msg_l is without source addr, msg_l and checksum
-        if len(ba) == 2:  # can not even check reply_hint
-          if missing_bytes > 36:  # longest official msg_l is 35 → msg probably broken
-            return 9
-          else:
-            return missing_bytes
-        elif ba[2] != op_code_hint.value:  # not our msg; (probably not a msg at all)
-          del ba[0]
-          continue
-        elif missing_bytes > 0:
-          return missing_bytes
-        elif functools.reduce(operator.xor, ba[:msg_l+3]) != 0x50:  # checksum wrong
-          del ba[0]
-          continue
-        else: # jackpot
-          return ba[1:-1]
+      missing_bytes = len_min - len(ba)
+      if missing_bytes > 0:
+        return missing_bytes
+      msg_l = (ba[1] & ~0x80) + 3  # + source addr, msg_l itself and checksum
+      if msg_l < len_min or msg_l > len_max or not ba[1] & 0x80:
+        del ba[0]
+        continue
+      missing_bytes = msg_l - len(ba)
+      if missing_bytes > 0:
+        return missing_bytes
+      if ba[2] != op_code:  # not our msg; (probably not a msg at all)
+        del ba[:2]  # length byte with 0x80 can’t be 0x6e
+        continue
+      if functools.reduce(operator.xor, ba[:msg_l]) != 0x50:  # checksum wrong
+        del ba[:2]
+        continue
+      # jackpot
+      return ba[2:-1]
 
-  def read_nowait(self, amount, /, *, op_code_hint):
+  def read_nowait(self, amount, op_code_hint):
     self.waiter.prepare('r')
     length = amount + 3
     ba = bytearray()
     amount_read = 0
+    op_code = op_code_hint.value[0]
+    len_min = functools.reduce(operator.add, op_code_hint.value[1:], 4)  # saddr, op, len, cksum
+    if 0 in op_code_hint.value[1:]:
+      # max len value 0x7f (including op byte) + sadddr, len, cksum; allowed actually only 32+3+3
+      len_max = 0x7f + 3
+    else:
+      len_max = len_min
     while amount_read < 1:
       value = self._i2c.read(length)
       amount_read += len(value)
       ba.extend(value)
-      res = Ddcci.check_read_bytes(ba, op_code_hint)
+      res = Ddcci.check_read_bytes(ba, op_code, len_min, len_max)
       if isinstance(res, int):
         length = res
       else:
@@ -506,10 +509,10 @@ class Mccs:
   _read_preparation_none = (None, None)
   class Op(enum.Enum):
     READ = (1, 1)
-    READ_REPLY = 2
+    READ_REPLY = (2, 1, 1, 1, 2, 2)
     WRITE = (3, 1, 2)
     CAPABILITIES = (0xf3, 2)
-    CAPABILITIES_REPLY = 0xe3
+    CAPABILITIES_REPLY = (0xe3, 2, 0)
 
   def __init__(self, *, file_name, open_config):
     self._ddcci = Ddcci(file_name=file_name, open_config=open_config)
@@ -528,13 +531,26 @@ class Mccs:
 
   @staticmethod
   def mccs2ddc(op, /, *args):
-    assert type(op) is Mccs.Op
-    assert type(op.value) is tuple
     assert len(op.value) == len(args) + 1
     res = [op.value[0]]
     for arg, length in zip(args, op.value[1:]):
       res.extend(arg.to_bytes(length, 'big'))
     return res
+
+  @staticmethod
+  def ddc2mccs(ba):
+    op = next(o for o in Mccs.Op if o.value[0] == ba[0])
+    res = []
+    pos = 1
+    for length in op.value[1:]:
+      if length != 0:
+        res.append(int.from_bytes(ba[pos:pos+length], 'big'))
+        pos += length
+      else:
+        res.append(ba[pos:])
+        break  # anything other than 0 in the end is not implemented (yet)
+    return res
+
 
   @invalidate_read_preparation
   def write_nowait(self, vcpopcode, value):
@@ -543,20 +559,23 @@ class Mccs:
   write = variant(write_nowait, asynch=True)
 
   @invalidate_read_preparation
-  def read_nowait(self, vcpopcode):
-    read_this = (Mccs.Op.READ, vcpopcode)
+  def read_nowait(self, vcp_opcode):
+    read_this = (Mccs.Op.READ, vcp_opcode)
     if self._read_preparation != read_this:
       self._ddcci.write_nowait(Mccs.mccs2ddc(*read_this))
       self._read_preparation = read_this
-    b = self._ddcci.read_nowait(8, Mccs.Op.READ_REPLY)
+    supported, reply_vcp, type_code, max_value, cur_value = Mccs.ddc2mccs(
+      self._ddcci.read_nowait(8, Mccs.Op.READ_REPLY))
     checks = {
-      'supported VCP opcode': b[1] == 0,
-      'answer matches request': b[2] == vcpopcode,
+      'supported VCP opcode': supported == 0,
+      'answer matches request': reply_vcp == vcp_opcode,
         }
     if False in checks.values():
       raise IOError(checks)
-    # present value, max value, VCP type code (0 == Set parameter, 1 = Momentary)?!?
-    return int.from_bytes(b[6:8], 'big'), int.from_bytes(b[4:6], 'big'), b[3]
+    # VCP type code (0 == Set parameter, 1 = Momentary)?!?
+    if type_code:
+      print(f'Hey... I found sth with type_code = {type_code:#x} (op: {vcp_opcode:#x}).')
+    return cur_value, max_value, type_code
 
   read = variant(read_nowait, asynch=True)
 
@@ -566,16 +585,24 @@ class Mccs:
 
   @invalidate_read_preparation
   def read_capabilities_nowait(self):
-    if self.capabilities:
-      return self.capabilities
-    read_this = (Mccs.Op.CAPABILITIES, len(self._capabilities))
-    if self._read_preparation[0] != read_this[0]:
-      self._ddcci.write_nowait(Mccs.mccs2ddc(*read_this))
-      self._read_preparation = read_this
-    b = self._ddcci.read_nowait(35, Mccs.Op.CAPABILITIES_REPLY)  # max allowed fragment size 32; +3 capa header
-    checks = {
-      'is capabilities reply': b[0] == 
-    }
+    while not self.capabilities:
+      cap_len = len(self._capabilities)
+      read_this = (Mccs.Op.CAPABILITIES, cap_len)
+      if self._read_preparation[0] != read_this[0]:
+        self._ddcci.write_nowait(Mccs.mccs2ddc(*read_this))
+        self._read_preparation = read_this
+      # max allowed fragment size 32; +3 capa header
+      offset, ba = Mccs.ddc2mccs(self._ddcci.read_nowait(35, Mccs.Op.CAPABILITIES_REPLY))
+      assert offset <= cap_len
+      if offset == cap_len and not ba:  # EOS
+        self.capabilities = self._capabilities
+        break
+      if offset < cap_len:
+        print('Got a capability fragment in the middle...')
+      self._capabilities[offset:offset+len(ba)] = ba
+    return self.capabilities
+
+  read_capabilities_wait = variant(read_capabilities_nowait, sync=True)
 
   @invalidate_read_preparation
   def timing_nowait(self):
@@ -900,9 +927,9 @@ class MonitorController:
         result = self.operations[operation](task.register, *op_args)
       except WouldBlockTime as e:
         sleep = e.wait_time
-      except IOError:
+      except IOError as e:
         # traceback.print_exc()
-        print(f'IOError on {operation} in handle_tasks(). Keeping operation in schedule.')
+        print(f'{e!r} on {operation} in handle_tasks(). Keeping operation in schedule.')
       else:
         ack_func(result)
         self._interacted(task)
