@@ -370,10 +370,14 @@ class Ddcci:
         del ba[:2]
         continue
       # jackpot
-      return ba[2:-1]
+      return ba[2:msg_l-1]
 
   def read_nowait(self, amount, op_code_hint):
-    self.waiter.prepare('r')
+    if op_code_hint == Mccs.Op.CAPABILITIES_REPLY:
+      extra_wait = .05
+    else:
+      extra_wait = 0
+    self.waiter.prepare('r', extra_wait=extra_wait)
     length = amount + 3
     ba = bytearray()
     amount_read = 0
@@ -449,13 +453,13 @@ class Waiter:
     self.delays['rw'] = max(*raw.values())
     print(self.delays)
 
-  def prepare(self, which):
+  def prepare(self, which, extra_wait=0):
     '''Either raise WouldBlockTime with corresponding timeout or update this Waiter
     to reflect execution of the corresponding operation. I.e. the prepared op should
     be called immediately.'''
     assert which in ('r', 'w')
     succession = self.last_which + which
-    wait_time = self.last_when + self.delays[succession] - time.time()
+    wait_time = self.last_when + self.delays[succession] - time.time() + extra_wait
     # print(f'{succession}: {wait_time}s')
     wait_time = max(0, wait_time)
     if wait_time:
@@ -593,6 +597,7 @@ class Mccs:
         self._read_preparation = read_this
       # max allowed fragment size 32; +3 capa header
       offset, ba = Mccs.ddc2mccs(self._ddcci.read_nowait(35, Mccs.Op.CAPABILITIES_REPLY))
+      self._read_preparation = self._read_preparation_none
       assert offset <= cap_len
       if offset == cap_len and not ba:  # EOS
         self.capabilities = self._capabilities
@@ -602,7 +607,7 @@ class Mccs:
       self._capabilities[offset:offset+len(ba)] = ba
     return self.capabilities
 
-  read_capabilities_wait = variant(read_capabilities_nowait, sync=True)
+  read_capabilities_sync = variant(read_capabilities_nowait, sync=True)
 
   @invalidate_read_preparation
   def timing_nowait(self):
@@ -869,7 +874,8 @@ class MonitorController:
     self._prio_changed = trio.Event()  # or possibly changed
     self._interaction_log = {}
     self.needs_reset52 = Needs_reset52(4)
-    nursery.start_soon(self._handle_tasks)
+    if nursery:
+      nursery.start_soon(self._handle_tasks)
 
   def _interacted(self, setting):
     self._interaction_log.pop(setting.register, None)
