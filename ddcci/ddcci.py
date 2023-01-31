@@ -1,29 +1,30 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 # coding: utf-8
 
-'''
-Copyright 2015 Robert Siemer
+# Copyright 2015 Robert Siemer
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Affero General Public License for more details.
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
 
-You should have received a copy of the GNU Affero General Public License
-along with this program.  If not, see <http://www.gnu.org/licenses/>.
-'''
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-from contextlib import contextmanager
+import contextlib
+import contextvars
 import enum
+import errno
 import fcntl
 import functools
 import glob
 import itertools
+import logging
 import operator
 import os
 import random
@@ -233,14 +234,44 @@ messages = {
   'read table': '6f 6e a3 e4 00 00 ', # wait 50ms
 }
 
-def printbytes(template, *args):
-  strings = []
-  for arg in args:
-    if isinstance(arg, str):
-      strings.append(arg)
-    else:
-      strings.append(' '.join(['{:02x}'.format(byte) for byte in arg]))
-  print(template.format(*strings))
+ctx_monitor = contextvars.ContextVar('ctx_mon')
+
+# frequency range: 0 - 50
+# below warning: 0 - 29
+# Info range: 20 - 29
+# Debug range: 10 - 19
+# annoyance, rarity, frequency
+
+
+# frequency
+# happens not at all, or not on each run: highest: 29 (legendary)
+# happens exactly once: 28 (once)
+# happens once, maybe more, but not by itself (external event req.): 27 (requested)
+# happens once, maybe more, even by itself,
+#   but probably very appreciated, low frequency: 26 (epic)
+# happens regularly, but is a very important beacon, does never burst: 24 (beacon)
+# temporarily active in unusual conditions, reasonable when it is: 23 (temp)
+# like 23, but a annoying: 22
+# happens regularly, maybe too much, but should default to “on” nevertheless: 21
+# above: does not make sense to switch off (for me), axf = amount * frequency
+
+# below: happens regularly, los = lock-on-scroll
+# planned not more than 1/s, but might break through: 19
+# axf does not require los, can be investigated life: 18
+# axf requires los for investigation on console: 12
+# axf large, but must be bearable: 11
+
+# below: even in development, default is always off
+# axf might be too big to be bearable: 9
+# axf → too big, a real nuisance: 5 (nuisance)
+# axf can only be handled with logfile(s) and searches: 1
+
+
+def log(frequency, category, msg):
+  mon = ctx_monitor.get(None)
+  if mon:
+    msg = f'{mon} {msg}'
+  logging.getLogger(category).log(frequency, msg)
 
 
 class I2cDev:
@@ -250,11 +281,17 @@ class I2cDev:
 
   def read(self, length):
     ba = os.read(self._dev, length)
-    if length < 20: printbytes('read: {}', ba)
+    level = logging.getLogger('hw_comm').getEffectiveLevel()
+    if level < 10 or len(ba) < 20:  # log in full
+      msg = f'read: {ba.hex(" ")}'
+    else:
+      msg = f'read: {ba[:19].hex(" ")} ...'
+    loglevel = 9 if level < 10 else 12
+    log(loglevel, 'hw_comm', msg)
     return ba
 
   def write(self, buffer):
-    printbytes('write: {}', buffer)
+    log(12, 'hw_comm', f'write: {buffer.hex(" ")}')
     return os.write(self._dev, buffer)
 
 class EdidDevice:
@@ -263,7 +300,7 @@ class EdidDevice:
     candidate = dev.read(512)  # current position unknown to us
     start = candidate.find(bytes.fromhex('00 FF FF FF FF FF FF 00'))
     if start < 0:
-      raise IOError()
+      raise OSError(errno.ENXIO, 'No EDID device found', file_name)
     edid = candidate[start:start+256]
     manu_code = int.from_bytes(edid[8:10], 'big')
     manufacturer = ''
@@ -273,6 +310,7 @@ class EdidDevice:
     self.edid256 = edid  # always 256 bytes long even for 128 byte EDIDs
     self.edid_id = manufacturer + edid[10:18].hex()  # PC/SN, manufacturing date
     self.file_name = file_name
+    log(28, 'hw_enum', f'{self.edid_id} is {self.file_name}')
 
   @classmethod
   def match_edids(cls, monitor):
@@ -281,9 +319,6 @@ class EdidDevice:
           cls.device.remove(edev)
           monitor.init_with_ediddev(edev)
 
-
-class CrappyHardwareError(IOError):
-  pass
 
 class WouldBlockTime(Exception):
   def __init__(self, wait_time):
@@ -307,6 +342,8 @@ def variant(method, /, *, asynch=False, sync=False):
           await trio.sleep(e.wait_time)
         continue
       else:
+        if asynch:
+          await trio.sleep(0)
         return res
   if asynch:
     return hybrid_method
@@ -320,11 +357,10 @@ def variant(method, /, *, asynch=False, sync=False):
 
 
 class Ddcci:
-  def __init__(self, *, file_name, open_config):
-    self.waiter = Waiter(open_config)
+  def __init__(self, *, file_name, waiter, id):
+    self.id = id
+    self.waiter = waiter
     self._i2c = I2cDev(i2c_slave_addr=0x37, file_name=file_name)
-    self.set_delay = self.waiter.set_delay
-    self.safe_delay = self.waiter.safe_delay
 
   @staticmethod
   def ddc2i2c(buffer):
@@ -372,18 +408,14 @@ class Ddcci:
       # jackpot
       return ba[2:msg_l-1]
 
-  def read_nowait(self, amount, op_code_hint):
-    if op_code_hint == Mccs.Op.CAPABILITIES_REPLY:
-      extra_wait = .05
-    else:
-      extra_wait = 0
-    self.waiter.prepare('r', extra_wait=extra_wait)
+  def read_nowait(self, amount, op_hint):
+    self.waiter.prepare('r', op_hint=op_hint)
     length = amount + 3
     ba = bytearray()
     amount_read = 0
-    op_code = op_code_hint.value[0]
-    len_min = functools.reduce(operator.add, op_code_hint.value[1:], 4)  # saddr, op, len, cksum
-    if 0 in op_code_hint.value[1:]:
+    op_code = op_hint.value[0]
+    len_min = functools.reduce(operator.add, op_hint.value[1:], 4)  # saddr, op, len, cksum
+    if 0 in op_hint.value[1:]:
       # max len value 0x7f (including op byte) + sadddr, len, cksum; allowed actually only 32+3+3
       len_max = 0x7f + 3
     else:
@@ -397,9 +429,13 @@ class Ddcci:
         length = res
       else:
         return res
-    raise IOError('Continuous(?) reading did not reveal reply.')
+    raise OSError(errno.EIO, 'Continuous(?) reading did not reveal reply', self.id)
 
   read = variant(read_nowait, asynch=True)
+
+class FakeWaiter:
+  def prepare(*args, **kwargs):
+    pass
 
 class Waiter:
   def __init__(self, open_config):
@@ -435,7 +471,7 @@ class Waiter:
   def _set_delay_permanently(self, r, w):
     self._set_internal(dict(r=r, w=w))
 
-  @contextmanager
+  @contextlib.contextmanager
   def set_delay(self, *args, **kwargs):
     saved_delays = self.delays_raw
     self._set_delay_permanently(*args, **kwargs)
@@ -451,16 +487,17 @@ class Waiter:
     self.delays_raw = raw
     self.delays = dict(wr=raw['r'], ww=raw['w'], rr=0)
     self.delays['rw'] = max(*raw.values())
-    print(self.delays)
+    log(23, 'sleep', f'delays are {self.delays}')
 
-  def prepare(self, which, extra_wait=0):
+  def prepare(self, which, op_hint=None):
     '''Either raise WouldBlockTime with corresponding timeout or update this Waiter
     to reflect execution of the corresponding operation. I.e. the prepared op should
     be called immediately.'''
     assert which in ('r', 'w')
     succession = self.last_which + which
+    extra_wait = .05 if op_hint == Mccs.Op.CAPABILITIES_REPLY else 0
     wait_time = self.last_when + self.delays[succession] - time.time() + extra_wait
-    # print(f'{succession}: {wait_time}s')
+    log(12, 'sleep', f'succession {succession}: {wait_time}s')
     wait_time = max(0, wait_time)
     if wait_time:
       raise WouldBlockTime(wait_time)
@@ -493,21 +530,6 @@ def returns_cancel_scope(afunc):
       return await afunc(*args, **kwargs)
   return f
 
-def try_again(afunc):
-  async def new_afunc(*args, **kwargs):
-    for iteration in reversed(range(2)):
-      try:
-        res = await afunc(*args, **kwargs)
-      except CrappyHardwareError:
-        if iteration == 0:
-          raise
-        else:
-          continue
-      else:
-        break
-    return res
-  return new_afunc
-
 
 class Mccs:
   _read_preparation_none = (None, None)
@@ -518,13 +540,13 @@ class Mccs:
     CAPABILITIES = (0xf3, 2)
     CAPABILITIES_REPLY = (0xe3, 2, 0)
 
-  def __init__(self, *, file_name, open_config):
-    self._ddcci = Ddcci(file_name=file_name, open_config=open_config)
+  def __init__(self, *, file_name, open_config, id):
+    self.id = id
+    self.waiter = Waiter(open_config)
+    self._ddcci = Ddcci(file_name=file_name, waiter=self.waiter, id=id)
     self._read_preparation = Mccs._read_preparation_none
     self._capabilities = bytearray()  # half-read capas
     self.capabilities = None  # final capas (if read)
-    self.safe_delay = self._ddcci.safe_delay
-    self.set_delay = self._ddcci.set_delay
 
   async def optimize_delays(self):
     if self._ddcci.waiter.has_default_delay():
@@ -570,15 +592,14 @@ class Mccs:
       self._read_preparation = read_this
     supported, reply_vcp, type_code, max_value, cur_value = Mccs.ddc2mccs(
       self._ddcci.read_nowait(8, Mccs.Op.READ_REPLY))
-    checks = {
-      'supported VCP opcode': supported == 0,
-      'answer matches request': reply_vcp == vcp_opcode,
-        }
-    if False in checks.values():
-      raise IOError(checks)
+    if supported != 0:
+      raise OSError(errno.EOPNOTSUPP, 'VCP opcode not supported', vcp_opcode)
+    elif reply_vcp != vcp_opcode:
+      raise OSError(errno.EL2NSYNC, 'Read result from a different request', vcp_opcode, None, reply_vcp)
     # VCP type code (0 == Set parameter, 1 = Momentary)?!?
     if type_code:
-      print(f'Hey... I found sth with type_code = {type_code:#x} (op: {vcp_opcode:#x}).')
+      log(26, 'hw_comm', f'Found op with type_code = {type_code:#x} '
+        '(op: {vcp_opcode:#x}).')
     return cur_value, max_value, type_code
 
   read = variant(read_nowait, asynch=True)
@@ -603,7 +624,7 @@ class Mccs:
         self.capabilities = self._capabilities
         break
       if offset < cap_len:
-        print('Got a capability fragment in the middle...')
+        log(29, 'hw_comm', 'Monitor sent overlapping capability fragment.')
       self._capabilities[offset:offset+len(ba)] = ba
     return self.capabilities
 
@@ -614,16 +635,13 @@ class Mccs:
     self._ddcci.write([0x07])
     return self._ddcci.read(6)
 
-  @try_again
   async def get_brightness_both(self):
     c, m, _ = (await self.read(0x10))
     return c, m
 
-  @try_again
   async def get_brightness_max(self):
     return (await self.read(0x10))[1]
 
-  @try_again
   async def get_brightness(self):
     return (await self.read(0x10))[0]
 
@@ -705,7 +723,7 @@ class Setting52(BaseSetting):
         if setting.writings_left == 0:  # ...and we don’t change sth ourselves rn
           setting.reread(from52=True)  # trigger new read on different register
       else:
-        print(f'Setting52: Setting {value:#x} is not handled by me yet.')
+        log(29, 'hw_comm', f'Setting52: Setting {value:#x} is not handled by me yet.')
         if self.last_value == value and not self.controller.needs_reset52.locked():
           # Avoid getting stuck! Problem:
           # - needs_reset52 is not settled and defaults to False
@@ -768,7 +786,7 @@ class Setting(BaseSetting):
       while self.max_listeners:
         self.max_listeners.pop()(max)
     elif self.max != max:
-      print(f'Max value on {self.register:#x} changed from {self.max} to {max}. Ignoring.')
+      log(29, 'hw_comm', f'Max value on {self.register:#x} changed from {self.max} to {max}. Ignoring.')
     assert not self.max_listeners
 
   def ack_read(self, result):
@@ -780,10 +798,10 @@ class Setting(BaseSetting):
     if self.new_value is not None and self.new_value != value:  # writings did not succeed
       if self.new_value > max:  # ...and it probably never will succeed
         self.new_value = value
-        print(f'Caught write with value beyond max {max}. Leaving it at current value {value}.')
+        log(29, 'hw_comm', f'Caught write with value beyond max {max}. Leaving it at current value {value}.')
       else:
         self.writings_left = Setting.writing_cycles
-        print(f'Control read on {self.register:#x} was {value} instead of {self.new_value}.')
+        log(21, 'hw_comm', f'Control read on {self.register:#x} was {value} instead of {self.new_value}.')
     else:  # writing worked fine (or not coming from writing: reread, initial read)
       assert self.writings_left == 0
     if self.before_52_fresh == value:  # pre-reset value read
@@ -850,12 +868,12 @@ class Needs_reset52:
 
   def no(self):
     if not self.locked():
-      print('monitor needs_reset52: no')
+      log(27, 'hw_comm', 'needs_reset52: no')
       self._x = -1
 
   def yes(self):
     if not self.locked():
-      if self._x == self._max - 1: print('monitor needs_reset52: yes')
+      if self._x == self._max - 1: log(27, 'hw_comm', 'needs_reset52: yes')
       self._x = min(self._max, self._x+1)
 
   def val(self):
@@ -864,9 +882,9 @@ class Needs_reset52:
 class MonitorController:
   def __init__(self, edid_device, nursery):
     self.edid_device = edid_device
-    self.open_config = functools.partial(xdg.open_config,
-        f'd2see/{edid_device.edid_id}')
-    self._mccs = Mccs(file_name=edid_device.file_name, open_config = self.open_config)
+    self.id = edid_device.edid_id
+    self.open_config = functools.partial(xdg.open_config, f'd2see/{self.id}')
+    self._mccs = Mccs(file_name=edid_device.file_name, open_config=self.open_config, id=self.id)
     self.operations = dict(read=self._mccs.read_nowait, write=self._mccs.write_nowait)
     self._settings = SettingsDict(self)
     self._settings[0x52] = Setting52(self)
@@ -888,12 +906,12 @@ class MonitorController:
     for dev_name in glob.glob('/dev/i2c-*'):
       try:
         edid_device = EdidDevice(dev_name)
-      except IOError:
+      except OSError:
         continue
       else:
         mcs.append(MonitorController(edid_device=edid_device, nursery=nursery))
         if edid_device.edid256 in edid_datas:
-          print('Monitors with the same EDID found. ' \
+          log(logging.WARNING, 'hw_enum', 'Monitors with the same EDID found. ' \
                 'This will probably mess things up.')
         else:
           edid_datas.add(edid_device.edid256)
@@ -920,6 +938,7 @@ class MonitorController:
       self._prio_changed = trio.Event()
 
   async def _handle_tasks(self):
+    ctx_monitor.set(self.id)
     await self._mccs.optimize_delays()
     sleep = 0
     while True:
@@ -933,9 +952,9 @@ class MonitorController:
         result = self.operations[operation](task.register, *op_args)
       except WouldBlockTime as e:
         sleep = e.wait_time
-      except IOError as e:
+      except OSError as e:
         # traceback.print_exc()
-        print(f'{e!r} on {operation} in handle_tasks(). Keeping operation in schedule.')
+        log(29, 'hw_comm', f'{e!r} on {operation} in handle_tasks(). Keeping op in schedule.')
       else:
         ack_func(result)
         self._interacted(task)
@@ -947,7 +966,7 @@ class TimingTest:
 
   async def safe_check(self):
     m = self.monitor
-    with m.safe_delay():
+    with m.waiter.safe_delay():
       orig, mx = await m.get_brightness_both()
       v = 1 if orig == 0 else orig - 1
       await m.set_brightness(v)
@@ -962,7 +981,7 @@ class TimingTest:
   async def _test_read(self, failure_rate, mx, r, w):
     m = self.monitor
     tokens, repeat = self._tokens_repeat(failure_rate)
-    with m.set_delay(r, w):
+    with m.waiter.set_delay(r, w):
       for i in range(repeat):
         v = random.randint(0, mx)
         await m.set_brightness(v)
@@ -981,11 +1000,11 @@ class TimingTest:
     tokens, repeat = self._tokens_repeat(failure_rate)
     for i in range(repeat):
       burst = random.randint(3, 8)
-      with m.set_delay(r, w):
+      with m.waiter.set_delay(r, w):
         for j in range(burst):
           v = random.randint(0, mx)
           await m.set_brightness(v)
-      with m.safe_delay():
+      with m.waiter.safe_delay():
         if await m.get_brightness() != v:
           if not tokens:
             return False
@@ -999,7 +1018,8 @@ class TimingTest:
     start = time.time()
     testfunc = self._test_read if what == 'read' else self._test_write
     result = await testfunc(failure_rate, mx, r, w)
-    print(f'{"SUCC" if result else "FAIL"} {what[0]} delay ({r}, {w}) took {time.time() - start} seconds')
+    r = "SUCC" if result else "FAIL"
+    log(22, 'test', f'{r} {what[0]} delay ({r}, {w}) took {time.time() - start} seconds')
     return result
 
   async def determine_delays(self):

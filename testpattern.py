@@ -1,14 +1,8 @@
 #!/usr/bin/python3
 
 import gi
-import trio
-import trio_gtk
-
 gi.require_version('Gtk', '3.0')
-
 from gi.repository import Gtk, Gdk
-
-from ddcci import ddcci
 
 class TestPattern(Gtk.Bin):
     def __init__(self, *args, **kwargs):
@@ -129,14 +123,15 @@ class MonitorScale(Gtk.HBox):
 
 
 class PatternWindow(Gtk.Window):
-    def __init__(self, monitor_controllers, desktop_index):
+    def __init__(self, monitor_controllers, desktop_index, main_cancel_scope):
         super().__init__(title='d2see test pattern')
         self.desktop_index = desktop_index
-        self.connect('delete-event', Gtk.main_quit)
+        cancel = lambda *args: main_cancel_scope.cancel()
+        self.connect('delete-event', cancel)
         self.connect('map-event', self.mapped)
         label_hello = Gtk.Label(label='Hello!')
         button_close = Gtk.Button(label='Close')
-        button_close.connect('clicked', Gtk.main_quit)
+        button_close.connect('clicked', cancel)
         button_box = Gtk.HButtonBox()
         button_box.pack_start(button_close, False, False, 0)
         hbox_bottom = Gtk.HBox()
@@ -162,9 +157,3 @@ class PatternWindow(Gtk.Window):
         # other move ops don’t work on i3 window manager
         self.get_window().move_to_desktop(self.desktop_index)
         self.fullscreen()
-
-async def main():
-    pass
-
-if __name__ == '__main__':
-    trio_gtk.run(main)

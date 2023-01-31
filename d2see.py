@@ -1,8 +1,10 @@
 #!/usr/bin/python3
 
-import functools
+import argparse
 import inspect
+import logging
 import re
+import sys
 
 import ewmh
 import gi
@@ -10,12 +12,13 @@ import trio
 import trio_gtk
 import Xlib.display
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, GdkX11
+from gi.repository import Gtk, GLib
 
 from ddcci import ddcci
 import testpattern
-import xdg
 
+def log(frequency, category, msg):
+  logging.getLogger(category).log(frequency, msg)
 
 def gtext(text):
     return gtext.single_nl.sub(' ', inspect.cleandoc(text))
@@ -81,7 +84,7 @@ class Assistant(Gtk.Assistant):
 
         return page_nr + 1
 
-def create_windows(monitor_controllers):
+def create_windows(monitor_controllers, main_cancel_scope):
     monitor_controllers = monitor_controllers.copy()
     display = Xlib.display.Display()
     root = display.screen().root
@@ -99,16 +102,55 @@ def create_windows(monitor_controllers):
             mc = next(mc for mc in monitor_controllers if edid_match(mc, randr_edid))
             monitor_controllers.remove(mc)
             matching_controllers.append(mc)
+        monitor_names = list(map(lambda mc: mc.edid_device.edid_id, matching_controllers))
+        log(27, 'hw_enum',
+            f'Xrandr monitor {connector_name} is composed of {monitor_names}.')
         viewports = ewmh.EWMH().getDesktopViewPort()
         for desktop_index, (x, y) in enumerate(zip(viewports[0::2], viewports[1::2])):
             if (randr_monitor.x, randr_monitor.y) == (x, y):
-                windows.append(testpattern.PatternWindow(matching_controllers, desktop_index))
+                log(27, 'hw_enum', f'...and desktop {desktop_index} is on it')
+                windows.append(testpattern.PatternWindow(matching_controllers, desktop_index, main_cancel_scope))
     return windows
 
 async def main():
+    parser = argparse.ArgumentParser(description=
+        'Adjust screen brightness and contrast of multiple monitors all at once.')
+    a = parser.add_argument
+    a('--debug-levels', nargs=2, default=[20, 10], metavar=('DEF', 'CAT'),
+        help='sets default log level to DEF and categories mentioned with --debug to level CAT')
+    a('-d', '--debug', nargs='+', default=[],
+        help='e.g. `--debug hw_comm sleep=25`, which sets sleep to level 25 '
+        'and hw_comm’s level to the second number of the `--debug-levels` option')
+    args = parser.parse_args()
+
+    logging.basicConfig(level=args.debug_levels[0])
+    for debug_arg in args.debug:
+        category, *level = debug_arg.rsplit('=', 1)
+        level = level[0] if level else args.debug_levels[1]
+        logging.getLogger(category).setLevel(level)
+
     async with trio.open_nursery() as nursery:
         mcs = ddcci.MonitorController.coldplug(nursery)
-        create_windows(mcs)
+        create_windows(mcs, nursery.cancel_scope)
+
+def trio_gtk_run(trio_main, *trio_main_args):
+    """Run Trio and PyGTK together."""
+    outcome = None
+
+    def done_callback(outcome_trio_main):
+        nonlocal outcome
+        outcome = outcome_trio_main
+        Gtk.main_quit()
+
+    trio.lowlevel.start_guest_run(
+        trio_main, *trio_main_args,
+        run_sync_soon_threadsafe=GLib.idle_add,
+        done_callback=done_callback,
+        host_uses_signal_set_wakeup_fd=True,
+    )
+
+    Gtk.main()
+    return outcome.unwrap()
 
 if __name__ == '__main__':
-    trio_gtk.run(main)
+    sys.exit(trio_gtk_run(main))
