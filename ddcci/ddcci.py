@@ -492,7 +492,7 @@ class Waiter:
     self.delays_raw = raw
     self.delays = dict(wr=raw['r'], ww=raw['w'], rr=0)
     self.delays['rw'] = max(*raw.values())
-    log(23, 'sleep', f'delays are {self.delays}')
+    log(23, 'sleep', f'delays are r={raw["r"]:.5}, w={raw["w"]:.5}')
 
   def prepare(self, which, op_hint=None):
     '''Either raise WouldBlockTime with corresponding timeout or update this Waiter
@@ -598,13 +598,13 @@ class Mccs:
     supported, reply_vcp, type_code, max_value, cur_value = Mccs.ddc2mccs(
       self._ddcci.read_nowait(8, Mccs.Op.READ_REPLY))
     if supported != 0:
-      raise OSE(errno.EOPNOTSUPP, 'VCP not supported', hex(vcp_opcode))
+      raise OSE(errno.ENOTSUP, 'VCP not supported', hex(vcp_opcode))
     elif reply_vcp != vcp_opcode:
       raise OSE(errno.EL2NSYNC, 'Read result from a different request',
         hex(vcp_opcode), None, hex(reply_vcp))
     # VCP type code (0 == Set parameter, 1 = Momentary)?!?
-    if type_code:
-      log(26, 'hw_comm', f'Found op with type_code = {type_code:#x} (op: {vcp_opcode:#x}).')
+    if type_code not in (0, 1) or vcp_opcode != 0x52 and type_code:
+      log(29, 'hw_comm', f'Found op with type_code = {type_code:#x} (op: {vcp_opcode:#x}).')
     return cur_value, max_value, type_code
 
   read = variant(read_nowait, asynch=True)
@@ -685,7 +685,7 @@ class Setting2:
 
   def select_operation(self):
     assert self.writings_left
-    return 'write', (self.new_value,), self.ack_write
+    return 'write', (self.new_value,), self.ack_write, None
 
   def _write(self, value):
     self.new_value = value
@@ -712,9 +712,14 @@ class Setting52(BaseSetting):
   def select_operation(self):
     time_left = self.next_check - time.time()
     if time_left <= 0:
-      return 'read', (), self.ack_read
+      return 'read', (), self.ack_read, self.nack_read
     else:
-      return 'wait', time_left, 0
+      return 'wait', time_left, None, None
+
+  def nack_read(self, exc):
+    if exc.errno == errno.ENOTSUP:
+      log(27, 'hw_comm', 'Button events disabled or not supported.—Should scan settings instead...')
+      self.next_check = float('inf')
 
   def ack_read(self, result):
     value, *args = result
@@ -826,9 +831,9 @@ class Setting(BaseSetting):
 
   def select_operation(self):
     if self.writings_left == 0:
-      return 'read', (), self.ack_read
+      return 'read', (), self.ack_read, None
     else:
-      return 'write', (self.new_value,), self.ack_write
+      return 'write', (self.new_value,), self.ack_write, None
 
   def _write(self, value):
     '''Set write wish in fields.
@@ -949,7 +954,7 @@ class MonitorController:
     while True:
       task = await self._next_task(sleep)
       sleep = 0
-      operation, op_args, ack_func = task.select_operation()
+      operation, op_args, ack_func, nack_func = task.select_operation()
       if operation == 'wait':
         sleep = op_args
         continue
@@ -958,8 +963,9 @@ class MonitorController:
       except WouldBlockTime as e:
         sleep = e.wait_time
       except OSError as e:
-        # traceback.print_exc()
-        log(29, 'hw_comm', f'{e} on {operation} in handle_tasks(). Keeping op in schedule.')
+        log(29, 'hw_comm', f'{e} on {operation} in handle_tasks().')
+        if nack_func:
+          nack_func(e)
       else:
         ack_func(result)
         self._interacted(task)

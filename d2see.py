@@ -103,12 +103,11 @@ def create_windows(monitor_controllers, main_cancel_scope):
             monitor_controllers.remove(mc)
             matching_controllers.append(mc)
         monitor_names = list(map(lambda mc: mc.edid_device.edid_id, matching_controllers))
-        log(27, 'hw_enum',
-            f'Xrandr monitor {connector_name} is composed of {monitor_names}.')
+        log(27, 'hw_enum', f'Xrandr {connector_name} is {monitor_names}')
         viewports = ewmh.EWMH().getDesktopViewPort()
         for desktop_index, (x, y) in enumerate(zip(viewports[0::2], viewports[1::2])):
             if (randr_monitor.x, randr_monitor.y) == (x, y):
-                log(27, 'hw_enum', f'...and desktop {desktop_index} is on it')
+                log(27, 'hw_enum', f'...with desktop {desktop_index}')
                 windows.append(testpattern.PatternWindow(matching_controllers, desktop_index, main_cancel_scope))
     return windows
 
