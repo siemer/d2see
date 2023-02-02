@@ -3,7 +3,7 @@ import logging
 import sys
 import time
 
-from ddcci.ddcci import Mccs as M, Ddcci as D, I2cDev as I
+from ddcci.ddcci import Mccs as M, Ddcci as D, I2cDev as I, MonitorController as MC
 
 # monitor active: write(r) sleep() read(): ack
 # pipelining: write(w1+w2): (n)ack, (n)ack
@@ -14,7 +14,10 @@ from ddcci.ddcci import Mccs as M, Ddcci as D, I2cDev as I
 # read cancels: write(w) read(1) sleep(): does (not) cancel
 # interim writes: write(r) sleep() write(w) sleep() read(): (n)ack
 
-
+# def monitor_active():
+#     write(contrast)
+#     sleep()
+#     read(8)
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG, style='{',
@@ -22,6 +25,14 @@ logging.basicConfig(level=logging.DEBUG, style='{',
 d = log.debug
 
 i = I('/dev/i2c-4', 0x37)
+
+mcs = MC.coldplug(None)
+for mc in mcs:
+    print(mc.edid_device.edid_id, mc._mccs.read_capabilities_sync())
+
+
+sys.exit()
+
 def measure(amount):
     start = time.time()
     i.read(amount)
