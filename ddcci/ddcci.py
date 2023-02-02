@@ -267,6 +267,11 @@ ctx_monitor = contextvars.ContextVar('ctx_mon')
 # axf can only be handled with logfile(s) and searches: 1
 
 
+class OSE(OSError):
+  def __str__(self) -> str:
+    _, s = super().__str__().split(']', 1)
+    return f'[{errno.errorcode[self.errno]}]{s}'
+
 def log(frequency, category, msg):
   mon = ctx_monitor.get(None)
   if mon:
@@ -300,7 +305,7 @@ class EdidDevice:
     candidate = dev.read(512)  # current position unknown to us
     start = candidate.find(bytes.fromhex('00 FF FF FF FF FF FF 00'))
     if start < 0:
-      raise OSError(errno.ENXIO, 'No EDID device found', file_name)
+      raise OSE(errno.ENXIO, 'No EDID device found', file_name)
     edid = candidate[start:start+256]
     manu_code = int.from_bytes(edid[8:10], 'big')
     manufacturer = ''
@@ -429,7 +434,7 @@ class Ddcci:
         length = res
       else:
         return res
-    raise OSError(errno.EIO, 'Continuous(?) reading did not reveal reply', self.id)
+    raise OSE(errno.EIO, 'Continuous(?) reading did not reveal reply', self.id)
 
   read = variant(read_nowait, asynch=True)
 
@@ -593,13 +598,13 @@ class Mccs:
     supported, reply_vcp, type_code, max_value, cur_value = Mccs.ddc2mccs(
       self._ddcci.read_nowait(8, Mccs.Op.READ_REPLY))
     if supported != 0:
-      raise OSError(errno.EOPNOTSUPP, 'VCP opcode not supported', vcp_opcode)
+      raise OSE(errno.EOPNOTSUPP, 'VCP not supported', hex(vcp_opcode))
     elif reply_vcp != vcp_opcode:
-      raise OSError(errno.EL2NSYNC, 'Read result from a different request', vcp_opcode, None, reply_vcp)
+      raise OSE(errno.EL2NSYNC, 'Read result from a different request',
+        hex(vcp_opcode), None, hex(reply_vcp))
     # VCP type code (0 == Set parameter, 1 = Momentary)?!?
     if type_code:
-      log(26, 'hw_comm', f'Found op with type_code = {type_code:#x} '
-        '(op: {vcp_opcode:#x}).')
+      log(26, 'hw_comm', f'Found op with type_code = {type_code:#x} (op: {vcp_opcode:#x}).')
     return cur_value, max_value, type_code
 
   read = variant(read_nowait, asynch=True)
@@ -954,7 +959,7 @@ class MonitorController:
         sleep = e.wait_time
       except OSError as e:
         # traceback.print_exc()
-        log(29, 'hw_comm', f'{e!r} on {operation} in handle_tasks(). Keeping op in schedule.')
+        log(29, 'hw_comm', f'{e} on {operation} in handle_tasks(). Keeping op in schedule.')
       else:
         ack_func(result)
         self._interacted(task)
