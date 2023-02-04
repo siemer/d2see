@@ -249,6 +249,8 @@ ctx_monitor = contextvars.ContextVar('ctx_mon')
 # happens once, maybe more, but not by itself (external event req.): 27 (requested)
 # happens once, maybe more, even by itself,
 #   but probably very appreciated, low frequency: 26 (epic)
+# happens irregularly, (i.e. between “once, maybe more” and “regularly”) and there
+#   is only one number left: 25
 # happens regularly, but is a very important beacon, does never burst: 24 (beacon)
 # temporarily active in unusual conditions, reasonable when it is: 23 (temp)
 # like 23, but a annoying: 22
@@ -279,29 +281,57 @@ def log(frequency, category, msg):
   logging.getLogger(category).log(frequency, msg)
 
 
+# resilient operation means: compensate errors
+# non-resilient means: do _only_ what was asked for as dumb as possible
+#  * offer non-blocking API (i.e. no waits, but os.read/write() is okay)
+#  * do not repeat operations (throw on error)
+#  * this API needs to rely on external Waiter() for WouldBlockTime exceptions
+#  * this Waiter() decides if the non-blocking API is really non-blocking...
+
 class I2cDev:
-  def __init__(self, file_name, i2c_slave_addr):
+  def __init__(self, file_name, i2c_slave_addr, *, resilient=False):
     self._dev = os.open(file_name, os.O_RDWR)
+    self.resilient = resilient
+    self._max_tries = 5
     fcntl.ioctl(self._dev, 0x0703, i2c_slave_addr)  # CPP macro: I2C_SLAVE
 
+  def _operate(self, func, *args):
+    already_tried = 0
+    while already_tried < self._max_tries:
+      try:
+        already_tried += 1
+        result = func(self._dev, *args)
+      except OSError as e:
+        if self.resilient:
+          last_errno = e.errno
+          continue
+        raise
+      else:
+        if already_tried >= 2:
+          frequency = 29 if already_tried >= 3 else 25
+          log(frequency, 'hw_comm', f'I2C-{func.__name__} attempted {already_tried} times.')
+        return result
+    raise OSE(last_errno, f'I2C-dev disappeared or seriously blocking {func.__name__} attempts.')
+
   def read(self, length):
-    ba = os.read(self._dev, length)
+    result = self._operate(os.read, length)
     level = logging.getLogger('hw_comm').getEffectiveLevel()
-    if level < 10 or len(ba) < 20:  # log in full
-      msg = f'read: {ba.hex(" ")}'
+    if level < 10 or len(result) < 20:  # log in full
+      msg = f'read: {result.hex(" ")}'
     else:
-      msg = f'read: {ba[:19].hex(" ")} ...'
+      msg = f'read: {result[:19].hex(" ")} ...'
     loglevel = 9 if level < 10 else 12
     log(loglevel, 'hw_comm', msg)
-    return ba
+    return result
 
   def write(self, buffer):
+    result = self._operate(os.write, buffer)
     log(12, 'hw_comm', f'write: {buffer.hex(" ")}')
-    return os.write(self._dev, buffer)
+    return result
 
 class EdidDevice:
   def __init__(self, file_name):
-    dev = I2cDev(file_name=file_name, i2c_slave_addr=0x50)
+    dev = I2cDev(file_name=file_name, i2c_slave_addr=0x50, resilient=True)
     candidate = dev.read(512)  # current position unknown to us
     start = candidate.find(bytes.fromhex('00 FF FF FF FF FF FF 00'))
     if start < 0:
@@ -362,10 +392,11 @@ def variant(method, /, *, asynch=False, sync=False):
 
 
 class Ddcci:
-  def __init__(self, *, file_name, waiter, id):
+  def __init__(self, *, file_name, waiter, id, resilient=False):
+    self.resilient = resilient
     self.id = id
     self.waiter = waiter
-    self._i2c = I2cDev(i2c_slave_addr=0x37, file_name=file_name)
+    self._i2c = I2cDev(i2c_slave_addr=0x37, file_name=file_name, resilient=resilient)
 
   @staticmethod
   def ddc2i2c(buffer):
