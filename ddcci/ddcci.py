@@ -329,6 +329,35 @@ class I2cDev:
     log(12, 'hw_comm', f'write: {buffer.hex(" ")}')
     return result
 
+  def measure(self):
+    observed_max = .00023, .0005  # latter often ~.0003
+    def time_it(amount):
+      start = time.time()
+      os.read(self._dev, amount)
+      return time.time() - start
+    def calc_nm():
+      # times[0] = n * amount[0] + m
+      amounts = [1, 20]
+      times = list(map(time_it, amounts))
+      n = (times[1]- times[0]) / (amounts[1] - amounts[0])
+      m = times[1] - n * amounts[1]
+      return n, m
+    collected = []
+    tries = 0
+    while len(collected) < 3:
+      tries += 1
+      try:
+          collected.append(calc_nm())
+      except OSError:
+        if tries >= 10:
+          log(logging.WARNING, 'sleep', f'I2C communication severed ({collected}); using default timing')
+          return observed_max  # should take the hint and wait for the monitor to (re)appear instead
+    measured = tuple(map(max, zip(*collected)))
+    if any(map(lambda mo: mo[0] > mo[1], zip(measured, observed_max))):
+      log(logging.WARNING, 'sleep', 'I2C communication unusually slow.')
+    return measured
+
+
 class EdidDevice:
   def __init__(self, file_name):
     dev = I2cDev(file_name=file_name, i2c_slave_addr=0x50, resilient=True)

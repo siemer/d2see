@@ -5,8 +5,6 @@ import time
 
 from ddcci.ddcci import Mccs as M, Ddcci as D, I2cDev as I, MonitorController as MC
 
-# monitor active: write(r) sleep() read(): ack
-# pipelining: write(w1+w2): (n)ack, (n)ack
 # pipelining2: write(w1) write(w2) write(w3): (n)ack, (n)ack, (n)ack
 # immediate read: write(r) read(a_lot): works → if not, sleep() read() recovers?
 # chunked read: write(r) sleep() read(a_little)*: works
@@ -14,37 +12,41 @@ from ddcci.ddcci import Mccs as M, Ddcci as D, I2cDev as I, MonitorController as
 # read cancels: write(w) read(1) sleep(): does (not) cancel
 # interim writes: write(r) sleep() write(w) sleep() read(): (n)ack
 
-# def monitor_active():
-#     write(contrast)
-#     sleep()
-#     read(8)
 
-log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.DEBUG, style='{',
-    format='{relativeCreated:5.0f} {msg}')
-d = log.debug
+# read() and write() have previous sleep(enough)
 
-i = I('/dev/i2c-4', 0x37)
+def monitor_active():
+    write(r_brightness, sleep=True)
+    return correct(read(value, sleep=True), current_brightness)
 
-mcs = MC.coldplug(None)
-for mc in mcs:
-    print(mc.edid_device.edid_id, mc._mccs.read_capabilities_sync())
+def pipelining():
+    write(w_new_brightness + w_new_contrast, sleep=True)
+    sleep(enough) # extra sleep
+    write(r_brightness, sleep=True)
+    val1 = read(value, sleep=True)
+    write(r_contrast, sleep=True)
+    val2 = read(value, sleep=True)
+    return correct(val1), correct(val2)
 
+def pipelining2():
+    write(w_new_brightness + w_new_contrast)
+
+
+# log = logging.getLogger(__name__)
+# logging.basicConfig(level=logging.DEBUG, style='{',
+#     format='{relativeCreated:5.0f} {msg}')
+# d = log.debug
+
+
+#mcs = MC.coldplug(None)
+#for mc in mcs:
+#    print(mc.edid_device.edid_id, mc._mccs.read_capabilities_sync())
+
+for no in 2, 4, 5, 6:
+    i = I(f'/dev/i2c-{no}', 0x37)
+    print(no, i.measure())
 
 sys.exit()
-
-def measure(amount):
-    start = time.time()
-    i.read(amount)
-    return time.time() - start
-
-t1 = measure(1)
-t2 = measure(100)
-
-n = (t2 - t1) / (100 - 1)
-m = t1 - n
-
-print(f'n = {n}, m = {m}')
 
 o = M.Op
 
