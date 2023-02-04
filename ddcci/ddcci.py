@@ -414,7 +414,7 @@ class Ddcci:
   write = variant(write_nowait, asynch=True)
 
   @staticmethod
-  def check_read_bytes(ba, op_code, len_min, len_max):
+  def check_read_bytes(ba, op_hint):
     '''Search for a DDC/CI reply in `ba`.
     Return minimum number of bytes missing to complete message (→ read more)
     or the bytearray with the message.
@@ -425,17 +425,17 @@ class Ddcci:
         ba.clear()
       else:
         del ba[0:index]
-      missing_bytes = len_min - len(ba)
+      missing_bytes = op_hint.min_len - len(ba)
       if missing_bytes > 0:
         return missing_bytes
       msg_l = (ba[1] & ~0x80) + 3  # + source addr, msg_l itself and checksum
-      if msg_l < len_min or msg_l > len_max or not ba[1] & 0x80:
+      if msg_l < op_hint.min_len or msg_l > op_hint.max_len or not ba[1] & 0x80:
         del ba[0]
         continue
       missing_bytes = msg_l - len(ba)
       if missing_bytes > 0:
         return missing_bytes
-      if ba[2] != op_code:  # not our msg; (probably not a msg at all)
+      if ba[2] != op_hint.op:  # not our msg; (probably not a msg at all)
         del ba[:2]  # length byte with 0x80 can’t be 0x6e
         continue
       if functools.reduce(operator.xor, ba[:msg_l]) != 0x50:  # checksum wrong
@@ -449,18 +449,11 @@ class Ddcci:
     length = amount + 3
     ba = bytearray()
     amount_read = 0
-    op_code = op_hint.value[0]
-    len_min = functools.reduce(operator.add, op_hint.value[1:], 4)  # saddr, op, len, cksum
-    if 0 in op_hint.value[1:]:
-      # max len value 0x7f (including op byte) + sadddr, len, cksum; allowed actually only 32+3+3
-      len_max = 0x7f + 3
-    else:
-      len_max = len_min
     while amount_read < 1:
       value = self._i2c.read(length)
       amount_read += len(value)
       ba.extend(value)
-      res = Ddcci.check_read_bytes(ba, op_code, len_min, len_max)
+      res = Ddcci.check_read_bytes(ba, op_hint)
       if isinstance(res, int):
         length = res
       else:
@@ -576,6 +569,43 @@ class Mccs:
     CAPABILITIES = (0xf3, 2)
     CAPABILITIES_REPLY = (0xe3, 2, 0)
 
+    def __new__(cls, op, *args):
+      obj = object.__new__(cls)
+      obj._value_ = op
+      obj.op = op
+      obj.args = args
+      return obj
+
+    @property
+    def min_len(self):
+      return functools.reduce(operator.add, self.args, 4)  # saddr, op, len, cksum
+
+    @property
+    def max_len(self):
+      # max len value 0x7f (including op byte) + sadddr, len, cksum; allowed actually only 32+3+3
+      return 0x7f + 3 if 0 in self.args else self.min_len
+
+    def to_ddc(self, /, *args):
+      assert len(self.args) == len(args)
+      res = [self.op]
+      for arg, length in zip(args, self.args):
+        res.extend(arg.to_bytes(length, 'big'))
+      return res
+
+    @classmethod
+    def from_ddc(cls, ba):
+      res = []
+      pos = 1
+      for length in cls(ba[0]).args:
+        if length != 0:
+          res.append(int.from_bytes(ba[pos:pos+length], 'big'))
+          pos += length
+        else:
+          res.append(ba[pos:])
+          break  # anything other than 0 in the end is not implemented (yet)
+      return res
+
+
   def __init__(self, *, file_name, open_config, id):
     self.id = id
     self.waiter = Waiter(open_config)
@@ -591,42 +621,18 @@ class Mccs:
     else:
       await trio.sleep(0)
 
-  @staticmethod
-  def mccs2ddc(op, /, *args):
-    assert len(op.value) == len(args) + 1
-    res = [op.value[0]]
-    for arg, length in zip(args, op.value[1:]):
-      res.extend(arg.to_bytes(length, 'big'))
-    return res
-
-  @staticmethod
-  def ddc2mccs(ba):
-    op = next(o for o in Mccs.Op if o.value[0] == ba[0])
-    res = []
-    pos = 1
-    for length in op.value[1:]:
-      if length != 0:
-        res.append(int.from_bytes(ba[pos:pos+length], 'big'))
-        pos += length
-      else:
-        res.append(ba[pos:])
-        break  # anything other than 0 in the end is not implemented (yet)
-    return res
-
-
   @invalidate_read_preparation
   def write_nowait(self, vcpopcode, value):
-    return self._ddcci.write_nowait(Mccs.mccs2ddc(Mccs.Op.WRITE, vcpopcode, value))
+    return self._ddcci.write_nowait(Mccs.Op.WRITE.to_ddc(vcpopcode, value))
 
   write = variant(write_nowait, asynch=True)
 
   @invalidate_read_preparation
   def read_nowait(self, vcp_opcode):
-    read_this = (Mccs.Op.READ, vcp_opcode)
-    if self._read_preparation != read_this:
-      self._ddcci.write_nowait(Mccs.mccs2ddc(*read_this))
-      self._read_preparation = read_this
-    supported, reply_vcp, type_code, max_value, cur_value = Mccs.ddc2mccs(
+    if self._read_preparation != (Mccs.Op.READ, vcp_opcode):
+      self._ddcci.write_nowait(Mccs.Op.READ.to_ddc(vcp_opcode))
+      self._read_preparation = (Mccs.Op.READ, vcp_opcode)
+    supported, reply_vcp, type_code, max_value, cur_value = Mccs.Op.from_ddc(
       self._ddcci.read_nowait(8, Mccs.Op.READ_REPLY))
     if supported != 0:
       raise OSE(errno.ENOTSUP, 'VCP not supported', hex(vcp_opcode))
@@ -648,12 +654,11 @@ class Mccs:
   def read_capabilities_nowait(self):
     while not self.capabilities:
       cap_len = len(self._capabilities)
-      read_this = (Mccs.Op.CAPABILITIES, cap_len)
-      if self._read_preparation[0] != read_this[0]:
-        self._ddcci.write_nowait(Mccs.mccs2ddc(*read_this))
-        self._read_preparation = read_this
+      if self._read_preparation[0] != Mccs.Op.CAPABILITIES:
+        self._ddcci.write_nowait(Mccs.Op.CAPABILITIES.to_ddc(cap_len))
+        self._read_preparation = (Mccs.Op.CAPABILITIES, cap_len)
       # max allowed fragment size 32; +3 capa header
-      offset, ba = Mccs.ddc2mccs(self._ddcci.read_nowait(35, Mccs.Op.CAPABILITIES_REPLY))
+      offset, ba = Mccs.Op.from_ddc(self._ddcci.read_nowait(35, Mccs.Op.CAPABILITIES_REPLY))
       self._read_preparation = self._read_preparation_none
       assert offset <= cap_len
       if offset == cap_len and not ba:  # EOS
