@@ -21,15 +21,14 @@ import contextvars
 import enum
 import errno
 import fcntl
-import functools
 import glob
-import itertools
 import logging
 import operator
 import os
 import random
 import time
-import traceback
+from functools import partial, reduce
+from types import SimpleNamespace as namespace
 
 import trio
 from ddcci import xdg
@@ -234,7 +233,8 @@ messages = {
   'read table': '6f 6e a3 e4 00 00 ', # wait 50ms
 }
 
-ctx_monitor = contextvars.ContextVar('ctx_mon')
+ctx_monitor = contextvars.ContextVar('ctx_monitor')
+ctx_quirks = contextvars.ContextVar('ctx_quirks')
 
 # frequency range: 0 - 50
 # below warning: 0 - 29
@@ -420,19 +420,114 @@ def variant(method, /, *, asynch=False, sync=False):
     return async2sync
 
 
+class DdcciMsgReader:
+  source_addr, length_byte, op_code = [property(lambda self, _i=i: self._buffer[_i]) for i in range(3)]
+  length_byte_ok = property(lambda self: self.length_byte & 0x80)
+  mccs_length = property(lambda self: self.length_byte & ~0x80)
+  mccs_payload = property(lambda self: self._buffer[2:self.mccs_length+2])
+  # 3 → source addr, length_byte, checksum
+  ddc_length = property(lambda self: self.mccs_length + 3)
+  missing_ddc_bytes = property(lambda self: max(0, self.ddc_length - len(self._buffer)))
+  checksum_ok = property(lambda self: reduce(operator.xor, self._buffer[:self.ddc_length]) == 0x50)
+  is_empty = property(lambda self: len(self._buffer) == 0)
+
+  def __init__(self, ddcci, /):
+    self._buffer = bytearray()
+    self._ddcci = ddcci
+
+  def find_next_limited(self, op_hint):
+    for refill in range(3 if self._ddcci.resilient else 2):  # 1 or 2 refills
+      if refill:  # first is 0
+        self._refill(op_hint, missing_bytes)
+      msg, missing_bytes = self._evaluate(op_hint)
+      if msg:
+        return msg
+    raise OSE(errno.EIO, f'no msg with hint {op_hint}'
+      f' in {"non-" if not self._ddcci.resilient else ""}resilient read')
+
+  def _refill(self, op_hint, missing_bytes):
+    if isinstance(op_hint, int):
+      amount = op_hint
+    else:
+      amount = MccsOp.ddc_most_msg_len() if op_hint is None else op_hint.ddc_max_len
+      if self._ddcci.resilient:
+        if ctx_quirks.get().chopped_reads:
+          if missing_bytes:
+            amount = missing_bytes
+          else:
+            amount += 1
+        else:
+          amount += 5
+    self._ddcci.waiter.prepare('r', op_hint=op_hint)
+    self._buffer.extend(self._ddcci._i2c.read(amount))
+
+  def _move_to_start(self):
+    index = self._buffer.find(0x6e)  # “source address”; begin of every reply/reaction
+    if index == -1:
+      self._buffer.clear()
+    else:
+      del self._buffer[0:index]
+
+  def _evaluate(self, op_hint):
+    '''Returns two-tuple with at most one part being true. The first, reflecting a valid
+    DDC/CI message as bytes(), or the second the amount of missing bytes for a full
+    message. (If those missing bytes lead to a valid message, that means chopped reads work.)
+    Or, self.is_empty is true, then (None, 0) is returned.'''
+    while True:
+      self._move_to_start()
+      invalid = 0  # known minimum amount which can be skipped in search for msg
+      if self.is_empty:
+        return None, 0
+      elif len(self._buffer) == 1:
+        return None, (op_hint.ddc_min_len if isinstance(op_hint, MccsOp) else
+          MccsOp.ddc_most_msg_len()) - 1
+      elif not self.length_byte_ok:
+        invalid = 1
+      elif self.ddc_length > MccsOp.ddc_max_msg_len():
+        # larger not allowed, but possible, but extremely unlikely
+        invalid = 2
+      elif self.missing_ddc_bytes:
+        return None, self.missing_ddc_bytes
+      elif not self.checksum_ok:
+        invalid = 2
+      elif self._buffer.startswith(bytes.fromhex('6e 80 be')):
+        log(25, 'hw_comm', 'Null msg encountered. Ignoring.')  # might mean “not supported”...
+        invalid = 3
+      else:
+        try:
+          op = MccsOp(self.op_code)
+        except ValueError:
+          log(29, 'hw_comm', f'Unknown MCCS opcode {self.op_code:#x}; '
+            f'{self._buffer[:MccsOp.ddc_most_msg_len()].hex(" ")}')
+          invalid = 2
+        else:
+          if not (op.ddc_min_len <= self.ddc_length <= op.ddc_max_len):
+            invalid = 3
+          else:
+            msg = self.mccs_payload
+            if isinstance(op_hint, MccsOp) and self.op_code != op_hint.op_code:
+              log(29, 'hw_comm', f'Dropping unexpected msg: {msg.hex(" ")}')
+              invalid = self.ddc_length
+            else:
+              del self._buffer[:self.ddc_length]
+              log(9, 'hw_comm', f'msg: {msg}')
+              return msg, 0
+      del self._buffer[:invalid]
+
+
 class Ddcci:
-  def __init__(self, *, file_name, waiter, id, resilient=False):
+  def __init__(self, *, file_name, waiter, resilient=False):
     self.resilient = resilient
-    self.id = id
     self.waiter = waiter
     self._i2c = I2cDev(i2c_slave_addr=0x37, file_name=file_name, resilient=resilient)
+    self._reader = DdcciMsgReader(self)
 
   @staticmethod
   def ddc2i2c(buffer):
     ba = bytearray(buffer)
     ba.insert(0, len(ba) | 0x80)
     ba.insert(0, 0x51)
-    ba.append(functools.reduce(operator.xor, ba, 0x6e))
+    ba.append(reduce(operator.xor, ba, 0x6e))
     return ba
 
   def write_nowait(self, buffer):
@@ -442,52 +537,26 @@ class Ddcci:
 
   write = variant(write_nowait, asynch=True)
 
-  @staticmethod
-  def check_read_bytes(ba, op_hint):
-    '''Search for a DDC/CI reply in `ba`.
-    Return minimum number of bytes missing to complete message (→ read more)
-    or the bytearray with the message.
-    '''
-    while True:
-      index = ba.find(0x6e)  # “source address”; begin of every reply/reaction
-      if index == -1:
-        ba.clear()
-      else:
-        del ba[0:index]
-      missing_bytes = op_hint.min_len - len(ba)
-      if missing_bytes > 0:
-        return missing_bytes
-      msg_l = (ba[1] & ~0x80) + 3  # + source addr, msg_l itself and checksum
-      if msg_l < op_hint.min_len or msg_l > op_hint.max_len or not ba[1] & 0x80:
-        del ba[0]
-        continue
-      missing_bytes = msg_l - len(ba)
-      if missing_bytes > 0:
-        return missing_bytes
-      if ba[2] != op_hint.op:  # not our msg; (probably not a msg at all)
-        del ba[:2]  # length byte with 0x80 can’t be 0x6e
-        continue
-      if functools.reduce(operator.xor, ba[:msg_l]) != 0x50:  # checksum wrong
-        del ba[:2]
-        continue
-      # jackpot
-      return ba[2:msg_l-1]
+  def read_nowait(self, op_hint):
+    '''Returns the next DDC/CI message payload. Operates with
+    read buffer from previous operations for possible pipelining and
+    continuous reading from lower levels. How often low-level read()s is done
+    and the amount read() at once is outlined below. Raises OSError() if no msg
+    can be collected.
 
-  def read_nowait(self, amount, op_hint):
-    self.waiter.prepare('r', op_hint=op_hint)
-    length = amount + 3
-    ba = bytearray()
-    amount_read = 0
-    while amount_read < 1:
-      value = self._i2c.read(length)
-      amount_read += len(value)
-      ba.extend(value)
-      res = Ddcci.check_read_bytes(ba, op_hint)
-      if isinstance(res, int):
-        length = res
-      else:
-        return res
-    raise OSE(errno.EIO, 'Continuous(?) reading did not reveal reply', self.id)
+    * msg will be searched in buffer (from previous calls) first
+    * resilient operation (instance variable) refills buffer up to two times
+    * non-resilient op refills at most once
+    * op_hint can take three forms
+      * int → hw read() calls will request exactly this length to be read (no matter what)
+      * None → any ddc/ci msg will be returned, hw read() with common length (too short for frags)
+      * MccsOp member → only matching msg returned, hw read() with appropriate length
+    * resilient op read +1 bytes for hw that can do chopped reads, otherwise +5
+      * does not apply if op_hint is an int
+
+    Encountered null-messages will always only be logged.
+    '''
+    return self._reader.find_next_limited(op_hint)
 
   read = variant(read_nowait, asynch=True)
 
@@ -553,7 +622,7 @@ class Waiter:
     be called immediately.'''
     assert which in ('r', 'w')
     succession = self.last_which + which
-    extra_wait = .05 if op_hint == Mccs.Op.CAPABILITIES_REPLY else 0
+    extra_wait = .05 if op_hint == MccsOp.CAPABILITIES_REPLY else 0
     wait_time = self.last_when + self.delays[succession] - time.time() + extra_wait
     log(12, 'sleep', f'succession {succession}: {wait_time}s')
     wait_time = max(0, wait_time)
@@ -589,56 +658,57 @@ def returns_cancel_scope(afunc):
   return f
 
 
+class MccsOp(enum.Enum):
+  ddc_max_msg_len = staticmethod(lambda: MccsOp.CAPABILITIES_REPLY.ddc_max_len)  # max allowed
+  ddc_most_msg_len = staticmethod(lambda: MccsOp.READ_REPLY.ddc_min_len)  # max([most cases])
+  # ATTENTION: do not add an operation 0x6e without adapting `invalid = ...` in `_evaluate()`
+  READ = (1, 1)
+  READ_REPLY = (2, 1, 1, 1, 2, 2)
+  WRITE = (3, 1, 2)
+  CAPABILITIES = (0xf3, 2)
+  CAPABILITIES_REPLY = (0xe3, 2, 0)
+
+  def __new__(cls, op_code, *args):
+    obj = object.__new__(cls)
+    obj._value_ = op_code
+    obj.op_code = op_code
+    obj.args = args
+    return obj
+
+  # 4 → saddr, op, len, cksum
+  ddc_min_len = property(lambda self: reduce(operator.add, self.args, 4))
+  is_flex = property(lambda self: 0 in self.args)
+  # max len value 0x7f (including op byte) + 3 (source_addr, len, cksum)
+  # allowed actually only 32x fragment + 6 (source_addr, len, opcode, 2x offset, (frag), chksum)
+  ddc_max_len = property(lambda self: 38 if self.is_flex else self.ddc_min_len)
+
+  def to_ddc(self, /, *args):
+    assert len(self.args) == len(args)
+    res = [self.op_code]
+    for arg, length in zip(args, self.args):
+      res.extend(arg.to_bytes(length, 'big'))
+    return res
+
+  @classmethod
+  def from_ddc(cls, ba):
+    res = []
+    pos = 1
+    for length in cls(ba[0]).args:
+      if length != 0:
+        res.append(int.from_bytes(ba[pos:pos+length], 'big'))
+        pos += length
+      else:
+        res.append(ba[pos:])
+        break  # anything other than 0 in the end is not implemented (yet)
+    return res
+
+
 class Mccs:
   _read_preparation_none = (None, None)
-  class Op(enum.Enum):
-    READ = (1, 1)
-    READ_REPLY = (2, 1, 1, 1, 2, 2)
-    WRITE = (3, 1, 2)
-    CAPABILITIES = (0xf3, 2)
-    CAPABILITIES_REPLY = (0xe3, 2, 0)
 
-    def __new__(cls, op, *args):
-      obj = object.__new__(cls)
-      obj._value_ = op
-      obj.op = op
-      obj.args = args
-      return obj
-
-    @property
-    def min_len(self):
-      return functools.reduce(operator.add, self.args, 4)  # saddr, op, len, cksum
-
-    @property
-    def max_len(self):
-      # max len value 0x7f (including op byte) + sadddr, len, cksum; allowed actually only 32+3+3
-      return 0x7f + 3 if 0 in self.args else self.min_len
-
-    def to_ddc(self, /, *args):
-      assert len(self.args) == len(args)
-      res = [self.op]
-      for arg, length in zip(args, self.args):
-        res.extend(arg.to_bytes(length, 'big'))
-      return res
-
-    @classmethod
-    def from_ddc(cls, ba):
-      res = []
-      pos = 1
-      for length in cls(ba[0]).args:
-        if length != 0:
-          res.append(int.from_bytes(ba[pos:pos+length], 'big'))
-          pos += length
-        else:
-          res.append(ba[pos:])
-          break  # anything other than 0 in the end is not implemented (yet)
-      return res
-
-
-  def __init__(self, *, file_name, open_config, id):
-    self.id = id
+  def __init__(self, *, file_name, open_config):
     self.waiter = Waiter(open_config)
-    self._ddcci = Ddcci(file_name=file_name, waiter=self.waiter, id=id)
+    self._ddcci = Ddcci(file_name=file_name, waiter=self.waiter)
     self._read_preparation = Mccs._read_preparation_none
     self._capabilities = bytearray()  # half-read capas
     self.capabilities = None  # final capas (if read)
@@ -652,24 +722,24 @@ class Mccs:
 
   @invalidate_read_preparation
   def write_nowait(self, vcpopcode, value):
-    return self._ddcci.write_nowait(Mccs.Op.WRITE.to_ddc(vcpopcode, value))
+    return self._ddcci.write_nowait(MccsOp.WRITE.to_ddc(vcpopcode, value))
 
   write = variant(write_nowait, asynch=True)
 
   @invalidate_read_preparation
   def read_nowait(self, vcp_opcode):
-    if self._read_preparation != (Mccs.Op.READ, vcp_opcode):
-      self._ddcci.write_nowait(Mccs.Op.READ.to_ddc(vcp_opcode))
-      self._read_preparation = (Mccs.Op.READ, vcp_opcode)
-    supported, reply_vcp, type_code, max_value, cur_value = Mccs.Op.from_ddc(
-      self._ddcci.read_nowait(8, Mccs.Op.READ_REPLY))
+    if self._read_preparation != (MccsOp.READ, vcp_opcode):
+      self._ddcci.write_nowait(MccsOp.READ.to_ddc(vcp_opcode))
+      self._read_preparation = (MccsOp.READ, vcp_opcode)
+    supported, reply_vcp, type_code, max_value, cur_value = MccsOp.from_ddc(
+      self._ddcci.read_nowait(MccsOp.READ_REPLY))
     if supported != 0:
       raise OSE(errno.ENOTSUP, 'VCP not supported', hex(vcp_opcode))
     elif reply_vcp != vcp_opcode:
       raise OSE(errno.EL2NSYNC, 'Read result from a different request',
         hex(vcp_opcode), None, hex(reply_vcp))
     # VCP type code (0 == Set parameter, 1 = Momentary)?!?
-    if type_code not in (0, 1) or vcp_opcode != 0x52 and type_code:
+    if type_code not in (0, 1) or vcp_opcode != Setting52.register and type_code:
       log(29, 'hw_comm', f'Found op with type_code = {type_code:#x} (op: {vcp_opcode:#x}).')
     return cur_value, max_value, type_code
 
@@ -683,11 +753,10 @@ class Mccs:
   def read_capabilities_nowait(self):
     while not self.capabilities:
       cap_len = len(self._capabilities)
-      if self._read_preparation[0] != Mccs.Op.CAPABILITIES:
-        self._ddcci.write_nowait(Mccs.Op.CAPABILITIES.to_ddc(cap_len))
-        self._read_preparation = (Mccs.Op.CAPABILITIES, cap_len)
-      # max allowed fragment size 32; +3 capa header
-      offset, ba = Mccs.Op.from_ddc(self._ddcci.read_nowait(35, Mccs.Op.CAPABILITIES_REPLY))
+      if self._read_preparation[0] != MccsOp.CAPABILITIES:
+        self._ddcci.write_nowait(MccsOp.CAPABILITIES.to_ddc(cap_len))
+        self._read_preparation = (MccsOp.CAPABILITIES, cap_len)
+      offset, ba = MccsOp.from_ddc(self._ddcci.read_nowait(MccsOp.CAPABILITIES_REPLY))
       self._read_preparation = self._read_preparation_none
       assert offset <= cap_len
       if offset == cap_len and not ba:  # EOS
@@ -726,7 +795,7 @@ class BaseSetting:
     self.register = register
 
   def is_read_prepared(self):
-    return self.controller._mccs._read_preparation == (Mccs.Op.READ, self.register)
+    return self.controller._mccs._read_preparation == (MccsOp.READ, self.register)
 
   def max_interaction_index(self):
     return len(self.controller._settings)
@@ -765,8 +834,9 @@ class Setting2:
 
 
 class Setting52(BaseSetting):
+  register = 0x52
   def __init__(self, controller):
-    super().__init__(controller, 0x52)
+    super().__init__(controller, Setting52.register)
     self.last_value = None  # set to None on reset52()
     self.next_check = 0
 
@@ -806,7 +876,7 @@ class Setting52(BaseSetting):
           # - we don’t have a Setting*() for this value (which drives determination)
           # → either drive determination or reset52() to jump dead point
           self._reset52()
-      if self.controller.needs_reset52.val():  # need to advance manually
+      if self.controller.needs_reset52:  # need to advance manually
         self._reset52()
     self.last_value = value
 
@@ -931,42 +1001,56 @@ class SettingsDict(dict):
     self[key] = Setting(self._controller, key)
     return self[key]
 
-class Needs_reset52:
-  '''Starts as a fluent False. Will reach definitive state with yes()/no(). While fluent, a no()
-  locks it to False, and [max] yes() will lock it to True.'''
-  def __init__(self, max, /):
-    self._x = 0
-    self._max = max
+class Determination:
+  '''Starts in a fluent state with a boolean value of `default`. Will reach locked state
+  with yes()/no(). The state is represented by a value on a range from negated `no` over zero
+  to `yes`, starting at zero. (I.e. `no=2` and `yes=3` is a range from -2 to 3.)
+  Each yes()/no() will put
+  the state one `yes_step`/`no_step` within the range. When it reaches one of its ends, the
+  boolean value is locked to False on its negative end and True on the positive one.
+  `yes` being 0 is the same as `yes=1` and `yes_step=float('inf')`. Works analogue with `no`.'''
+  def __init__(self, name, *, yes, no, default, yes_step=1, no_step=1, log_category='hw_comm') -> None:
+    self._name = name
+    self._log_category = log_category
+    self._range = -no, yes
+    self._default = default
+    self._steps = -no_step, yes_step
+    self._pos = 0
+    for i in range(2):
+      if self._range[i] == 0:
+        neg = -1 if i == 0 else 1
+        self._steps[i] == float('inf') * neg
+        self._range[i] == 1 * neg
 
   def locked(self):
-    return True if self._x in (-1, self._max) else False
+    return self._range == (0, 0)
 
-  def no(self):
-    if not self.locked():
-      log(27, 'hw_comm', 'needs_reset52: no')
-      self._x = -1
+  def _yesno(self, yesno):
+    if self.locked(): return
+    self._pos = min(self._range[1], max(self._range[0], self._pos + self._steps[yesno]))
+    if self._pos in self._range:
+      self._default = False if self._pos == self._range[0] else True
+      self._range = (0, 0)
+      log(25, self._log_category, f'{self._name}: {bool(self)}')
 
-  def yes(self):
-    if not self.locked():
-      if self._x == self._max - 1: log(27, 'hw_comm', 'needs_reset52: yes')
-      self._x = min(self._max, self._x+1)
+  no, yes = [lambda self, _i=i: self._yesno(_i) for i in range(2)]
 
-  def val(self):
-    return False if self._x < self._max else True
+  def __bool__(self):
+    return self._default
 
 class MonitorController:
   def __init__(self, edid_device, nursery):
     self.edid_device = edid_device
     self.id = edid_device.edid_id
-    self.open_config = functools.partial(xdg.open_config, f'd2see/{self.id}')
-    self._mccs = Mccs(file_name=edid_device.file_name, open_config=self.open_config, id=self.id)
+    self.open_config = partial(xdg.open_config, f'd2see/{self.id}')
+    self._mccs = Mccs(file_name=edid_device.file_name, open_config=self.open_config)
     self.operations = dict(read=self._mccs.read_nowait, write=self._mccs.write_nowait)
     self._settings = SettingsDict(self)
-    self._settings[0x52] = Setting52(self)
+    self._settings[Setting52.register] = Setting52(self)
     self._settings[Setting2.register] = Setting2()
     self._prio_changed = trio.Event()  # or possibly changed
     self._interaction_log = {}
-    self.needs_reset52 = Needs_reset52(4)
+    self.needs_reset52 = Determination('needs_reset52', yes=4, no=0, default=False)
     if nursery:
       nursery.start_soon(self._handle_tasks)
 
@@ -1013,7 +1097,9 @@ class MonitorController:
       self._prio_changed = trio.Event()
 
   async def _handle_tasks(self):
+    quirks = namespace(chopped_reads=Determination('chopped_reads', default=True, yes=1, no=2))
     ctx_monitor.set(self.id)
+    ctx_quirks.set(quirks)
     await self._mccs.optimize_delays()
     sleep = 0
     while True:
