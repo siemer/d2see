@@ -11,6 +11,7 @@ from ddcci.ddcci import Mccs as M, Ddcci as D, I2cDev as I, MonitorController as
 # chunked read2: write(r) read(a_little)*: works == immedate read + chunked read?
 # read cancels: write(w) read(1) sleep(): does (not) cancel
 # interim writes: write(r) sleep() write(w) sleep() read(): (n)ack
+# circular buffer check: write(w1) sleep() read(2000)
 
 
 # read() and write() have previous sleep(enough)
