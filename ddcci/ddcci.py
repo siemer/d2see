@@ -695,7 +695,9 @@ class MccsOp(enum.Enum):
     pos = 1
     for length in cls(ba[0]).args:
       if length != 0:
-        res.append(int.from_bytes(ba[pos:pos+length], 'big'))
+        b = ba[pos:pos+length]
+        assert len(b) == length
+        res.append(int.from_bytes(b, 'big'))
         pos += length
       else:
         res.append(ba[pos:])
