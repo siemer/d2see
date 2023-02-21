@@ -855,10 +855,22 @@ class Setting52(BaseSetting):
 
   def nack_read(self, exc):
     if exc.errno == errno.ENOTSUP:
-      log(27, 'hw_comm', 'Button events disabled or not supported.—Should scan settings instead...')
-      self.next_check = float('inf')
+      supports52 = self.controller.supports52
+      supports52.no()
+      if supports52.locked():
+        if supports52:
+          p, m = 25, 'monitor forgot that it support 0x52 “event polling”'
+        else:
+          p, m = 27, 'Change-polling disabled or not supported.—Should scan settings instead...'
+          self.next_check = float('inf')
+      else:
+        p, m = 19, '0x52 reported as unsupported'
+      log(p, 'hw_comm', m)
+    else:
+      raise exc
 
   def ack_read(self, result):
+    self.controller.supports52.yes()
     value, *args = result
     if self.last_value not in (None, 0) and self.last_value != value:
       self.controller.needs_reset52.no()
@@ -1053,6 +1065,7 @@ class MonitorController:
     self._prio_changed = trio.Event()  # or possibly changed
     self._interaction_log = {}
     self.needs_reset52 = Determination('needs_reset52', yes=4, no=0, default=False)
+    self.supports52 = Determination('supports52', yes=0, no=3, default=True)
     if nursery:
       nursery.start_soon(self._handle_tasks)
 
