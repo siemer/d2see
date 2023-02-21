@@ -115,7 +115,7 @@ async def main():
     parser = argparse.ArgumentParser(description=
         'Adjust screen brightness and contrast of multiple monitors all at once.')
     a = parser.add_argument
-    a('--debug-levels', nargs=2, default=[20, 10], metavar=('DEF', 'CAT'),
+    a('--debug-levels', nargs=2, default=[20, 10], metavar=('DEF', 'CAT'), type=int,
         help='sets default log level to DEF and categories mentioned with --debug to level CAT')
     a('-d', '--debug', nargs='+', default=[],
         help='e.g. `--debug hw_comm sleep=25`, which sets sleep to level 25 '
@@ -125,7 +125,7 @@ async def main():
     logging.basicConfig(level=args.debug_levels[0])
     for debug_arg in args.debug:
         category, *level = debug_arg.rsplit('=', 1)
-        level = level[0] if level else args.debug_levels[1]
+        level = int(level[0]) if level else args.debug_levels[1]
         logging.getLogger(category).setLevel(level)
 
     async with trio.open_nursery() as nursery:
