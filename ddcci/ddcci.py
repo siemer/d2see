@@ -866,8 +866,7 @@ class Setting52(BaseSetting):
       else:
         p, m = 19, '0x52 reported as unsupported'
       log(p, 'hw_comm', m)
-    else:
-      raise exc
+      return True
 
   def ack_read(self, result):
     self.controller.supports52.yes()
@@ -1129,9 +1128,8 @@ class MonitorController:
       except WouldBlockTime as e:
         sleep = e.wait_time
       except OSError as e:
-        log(29, 'hw_comm', f'{e} on {operation} in handle_tasks().')
-        if nack_func:
-          nack_func(e)
+        if not (nack_func and nack_func(e)):
+          log(29, 'hw_comm', f'{e} on {operation} in handle_tasks().')
       else:
         ack_func(result)
         self._interacted(task)
