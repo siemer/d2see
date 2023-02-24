@@ -436,12 +436,22 @@ class DdcciMsgReader:
     self._ddcci = ddcci
 
   def find_next_limited(self, op_hint):
+    chopped_reads = ctx_quirks.get().chopped_reads
+    last_missing_bytes = False
     for refill in range(3 if self._ddcci.resilient else 2):  # 1 or 2 refills
       if refill:  # first is 0
         self._refill(op_hint, missing_bytes)
-      msg, missing_bytes = self._evaluate(op_hint)
+      from_start, msg, missing_bytes = self._evaluate(op_hint)
       if msg:
+        if last_missing_bytes:
+          if from_start:
+            chopped_reads.yes()
+          else:
+            chopped_reads.no()
         return msg
+      elif last_missing_bytes:
+        chopped_reads.no()
+      last_missing_bytes = missing_bytes
     raise OSE(errno.EIO, f'no msg with hint {op_hint}'
       f' in {"non-" if not self._ddcci.resilient else ""}resilient read')
 
@@ -463,23 +473,35 @@ class DdcciMsgReader:
 
   def _move_to_start(self):
     index = self._buffer.find(0x6e)  # “source address”; begin of every reply/reaction
-    if index == -1:
+    if index == 0:
+      return False
+    elif index == -1:
       self._buffer.clear()
     else:
       del self._buffer[0:index]
+    return True
 
   def _evaluate(self, op_hint):
-    '''Returns two-tuple with at most one part being true. The first, reflecting a valid
-    DDC/CI message as bytes(), or the second the amount of missing bytes for a full
-    message. (If those missing bytes lead to a valid message, that means chopped reads work.)
-    Or, self.is_empty is true, then (None, 0) is returned.'''
+    '''Returns three-tuple: from_start, msg, missing_bytes. from_start is True if a msg
+    could be detected without skipping bytes, otherwise False. msg is the message found
+    or None. missing_bytes indicates the bytes missing from a potential message fragment
+    to be completed. An empty buffer leads to (True, None, 0). This is the only case in
+    which msg and missing_bytes are falsy.
+
+    from_start helps to determine if chopped reads are supported: two consecutive calls
+    to this function should return (_, None, >0) and (True, msg, 0) to indicate that it
+    is. With the main point being that the first call returns positive missing_bytes and
+    the second has a True from_start and a msg.
+    '''
+    from_start = True
     while True:
-      self._move_to_start()
+      if self._move_to_start():
+        from_start = False
       invalid = 0  # known minimum amount which can be skipped in search for msg
       if self.is_empty:
-        return None, 0
+        return from_start, None, 0
       elif len(self._buffer) == 1:
-        return None, (op_hint.ddc_min_len if isinstance(op_hint, MccsOp) else
+        return from_start, None, (op_hint.ddc_min_len if isinstance(op_hint, MccsOp) else
           MccsOp.ddc_most_msg_len()) - 1
       elif not self.length_byte_ok:
         invalid = 1
@@ -487,7 +509,7 @@ class DdcciMsgReader:
         # larger not allowed, but possible, but extremely unlikely
         invalid = 2
       elif self.missing_ddc_bytes:
-        return None, self.missing_ddc_bytes
+        return from_start, None, self.missing_ddc_bytes
       elif not self.checksum_ok:
         invalid = 2
       elif self._buffer.startswith(bytes.fromhex('6e 80 be')):
@@ -511,7 +533,8 @@ class DdcciMsgReader:
             else:
               del self._buffer[:self.ddc_length]
               log(9, 'hw_comm', f'msg: {msg}')
-              return msg, 0
+              return from_start, msg, 0
+      from_start = False
       del self._buffer[:invalid]
 
 
