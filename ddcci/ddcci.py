@@ -430,6 +430,7 @@ class DdcciMsgReader:
   missing_ddc_bytes = property(lambda self: max(0, self.ddc_length - len(self._buffer)))
   checksum_ok = property(lambda self: reduce(operator.xor, self._buffer[:self.ddc_length]) == 0x50)
   is_empty = property(lambda self: len(self._buffer) == 0)
+  ddc_debug_peak = property(lambda self: self._buffer[:MccsOp.ddc_most_msg_len()].hex(" "))
 
   def __init__(self, ddcci, /):
     self._buffer = bytearray()
@@ -461,10 +462,11 @@ class DdcciMsgReader:
     else:
       amount = MccsOp.ddc_most_msg_len() if op_hint is None else op_hint.ddc_max_len
       if self._ddcci.resilient:
-        if ctx_quirks.get().chopped_reads:
+        chopped_reads = ctx_quirks.get().chopped_reads
+        if chopped_reads:
           if missing_bytes:
             amount = missing_bytes
-          else:
+          elif chopped_reads.locked():  # encourage determination of chopped_reads
             amount += 1
         else:
           amount += 5
@@ -511,6 +513,7 @@ class DdcciMsgReader:
       elif self.missing_ddc_bytes:
         return from_start, None, self.missing_ddc_bytes
       elif not self.checksum_ok:
+        log(29, 'hw_comm', f'DDC/CI checksum mismatch {self.ddc_debug_peak}')
         invalid = 2
       elif self._buffer.startswith(bytes.fromhex('6e 80 be')):
         log(25, 'hw_comm', 'Null msg encountered. Ignoring.')  # might mean “not supported”...
@@ -519,8 +522,7 @@ class DdcciMsgReader:
         try:
           op = MccsOp(self.op_code)
         except ValueError:
-          log(29, 'hw_comm', f'Unknown MCCS opcode {self.op_code:#x}; '
-            f'{self._buffer[:MccsOp.ddc_most_msg_len()].hex(" ")}')
+          log(29, 'hw_comm', f'Unknown MCCS op {self.op_code:#x}; {self.ddc_debug_peak}')
           invalid = 2
         else:
           if not (op.ddc_min_len <= self.ddc_length <= op.ddc_max_len):
@@ -733,7 +735,7 @@ class Mccs:
 
   def __init__(self, *, file_name, open_config):
     self.waiter = Waiter(open_config)
-    self._ddcci = Ddcci(file_name=file_name, waiter=self.waiter)
+    self._ddcci = Ddcci(file_name=file_name, waiter=self.waiter, resilient=True)
     self._read_preparation = Mccs._read_preparation_none
     self._capabilities = bytearray()  # half-read capas
     self.capabilities = None  # final capas (if read)
